@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# Datos del motor
+data/
+
+# PDFs del curso (material del profesor, no va al repo)
+*.pdf
+
+# Docker / SO
+*.log
+.DS_Store

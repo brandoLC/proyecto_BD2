@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    image: minidb-backend
+    container_name: minidb-backend
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - minidb-data:/data
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    image: minidb-frontend
+    container_name: minidb-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  minidb-data:
