@@ -3,7 +3,9 @@
 Gramática soportada (keywords case-insensitive, ';' final opcional)::
 
     statement   := create_table | create_index | insert | select | delete
+                 | load_file
     create_table:= CREATE TABLE ident '(' col_def (',' col_def)* ')'
+                 | CREATE TABLE ident FROM FILE STRING
     col_def     := ident type [PRIMARY KEY]
     type        := INT | FLOAT | BOOL | TEXT | POINT | VARCHAR '(' num ')'
     create_index:= CREATE INDEX [ident] ON ident '(' ident ')'
@@ -17,6 +19,7 @@ Gramática soportada (keywords case-insensitive, ';' final opcional)::
                  | ident IN '(' point ',' num ')'         (radio espacial)
                  | ident KNN '(' point ',' num ')'        (k vecinos)
     delete      := DELETE FROM ident WHERE ident '=' literal
+    load_file   := LOAD INTO ident FROM FILE STRING
 
 El AST se representa con diccionarios. Los errores de sintaxis llevan la
 posición (offset en caracteres) dentro del mensaje.
@@ -31,13 +34,14 @@ KEYWORDS = {
     "BOOL", "POINT", "INDEX", "ON", "USING", "BTREE", "HASH", "RTREE",
     "INSERT", "INTO", "VALUES", "SELECT", "FROM", "WHERE", "LIMIT",
     "BETWEEN", "AND", "IN", "KNN", "DELETE", "TRUE", "FALSE",
+    "FILE", "LOAD",
 }
 
 TOKEN_RE = re.compile(
     r"""
     (?P<ws>\s+)
   | (?P<number>\d+\.\d+|\d+)
-  | (?P<string>'(?:[^']|'')*')
+  | (?P<string>'(?:[^']|'')*'|"(?:[^"]|"")*")
   | (?P<op><=|>=|<>|!=|=|<|>)
   | (?P<punct>[(),;*\-])
   | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
@@ -157,6 +161,8 @@ class Parser:
             stmt = self._parse_select()
         elif tok.value == "DELETE":
             stmt = self._parse_delete()
+        elif tok.value == "LOAD":
+            stmt = self._parse_load()
         else:
             raise ParseError(f"sentencia no soportada: {tok.value}", tok.pos)
         tok = self.peek()
@@ -181,6 +187,10 @@ class Parser:
 
     def _parse_create_table(self) -> dict:
         name = self.expect_ident()
+        if self.accept_kw("FROM"):
+            self.expect_kw("FILE")
+            return {"type": "create_table_from_file", "table": name,
+                    "file": self._parse_string()}
         self.expect_punct("(")
         columns = [self._parse_col_def()]
         while self.peek().kind == "punct" and self.peek().value == ",":
@@ -251,8 +261,7 @@ class Parser:
         if tok.kind == "number":
             return self.expect_number()
         if tok.kind == "string":
-            self.advance()
-            return tok.value[1:-1].replace("''", "'")
+            return self._parse_string()
         if tok.kind == "kw" and tok.value in ("TRUE", "FALSE"):
             self.advance()
             return tok.value == "TRUE"
@@ -270,6 +279,17 @@ class Parser:
         y = self._parse_signed_number()
         self.expect_punct(")")
         return (float(x), float(y))
+
+    def _parse_string(self) -> str:
+        """Literal de texto con comillas simples o dobles (se duplican
+        para escaparlas)."""
+        tok = self.peek()
+        if tok.kind != "string":
+            raise ParseError(f"se esperaba un literal de texto, se "
+                             f"encontró {tok.value!r}", tok.pos)
+        self.advance()
+        q = tok.value[0]
+        return tok.value[1:-1].replace(q + q, q)
 
     def _parse_signed_number(self) -> int | float:
         tok = self.peek()
@@ -364,6 +384,18 @@ class Parser:
         value = self._parse_value()
         return {"type": "delete", "table": table, "column": column,
                 "value": value}
+
+    # ------------------------------------------------------------------
+    # LOAD INTO ... FROM FILE
+    # ------------------------------------------------------------------
+    def _parse_load(self) -> dict:
+        self.expect_kw("LOAD")
+        self.expect_kw("INTO")
+        table = self.expect_ident()
+        self.expect_kw("FROM")
+        self.expect_kw("FILE")
+        return {"type": "load_file", "table": table,
+                "file": self._parse_string()}
 
 
 def parse(sql: str) -> dict:

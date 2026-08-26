@@ -2,23 +2,23 @@
 const EXAMPLES = [
   {
     label: 'CREATE TABLE con POINT',
-    sql: `CREATE TABLE restaurantes (\n  id INT PRIMARY KEY,\n  nombre VARCHAR(50),\n  location POINT\n);`,
+    sql: `CREATE TABLE restaurantes (\n  id INT PRIMARY KEY,\n  nombre VARCHAR(50),\n  rating FLOAT,\n  location POINT\n);`,
   },
   {
-    label: 'CREATE INDEX BTREE',
-    sql: `CREATE INDEX idx_id ON restaurantes USING BTREE (id);`,
+    label: 'CREATE INDEX BTREE (la PK ya trae uno)',
+    sql: `CREATE INDEX idx_rating ON restaurantes (rating) USING BTREE;`,
   },
   {
     label: 'CREATE INDEX HASH',
-    sql: `CREATE INDEX idx_nombre ON restaurantes USING HASH (nombre);`,
+    sql: `CREATE INDEX idx_nombre ON restaurantes (nombre) USING HASH;`,
   },
   {
     label: 'CREATE INDEX RTREE',
-    sql: `CREATE INDEX idx_location ON restaurantes USING RTREE (location);`,
+    sql: `CREATE INDEX idx_location ON restaurantes (location) USING RTREE;`,
   },
   {
     label: 'INSERT',
-    sql: `INSERT INTO restaurantes VALUES (1, 'Punto Azul', (-12.05, -77.04));`,
+    sql: `INSERT INTO restaurantes VALUES (1, 'Punto Azul', 4.5, (-12.05, -77.04));`,
   },
   {
     label: 'SELECT por clave primaria',
@@ -26,7 +26,7 @@ const EXAMPLES = [
   },
   {
     label: 'SELECT rango BETWEEN',
-    sql: `SELECT * FROM restaurantes WHERE id BETWEEN 10 AND 50;`,
+    sql: `SELECT * FROM restaurantes WHERE rating BETWEEN 4.0 AND 4.8;`,
   },
   {
     label: 'Búsqueda espacial por radio',

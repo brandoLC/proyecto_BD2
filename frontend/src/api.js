@@ -20,6 +20,30 @@ export async function getTables() {
   return parseResponse(res)
 }
 
+// POST multipart: el backend puede devolver {ok:false,...} con código de error HTTP.
+async function postForm(url, form) {
+  const res = await fetch(url, { method: 'POST', body: form })
+  if (!res.ok) {
+    const data = await res.json().catch(() => null)
+    if (data) return data
+    throw new Error(`HTTP ${res.status}`)
+  }
+  return parseResponse(res)
+}
+
+export async function inferSchema(file, tableName) {
+  const form = new FormData()
+  form.append('file', file)
+  if (tableName) form.append('table_name', tableName)
+  return postForm('/api/infer-schema', form)
+}
+
+export async function uploadCsv(tableName, file) {
+  const form = new FormData()
+  form.append('file', file)
+  return postForm(`/api/tables/${encodeURIComponent(tableName)}/upload-csv`, form)
+}
+
 export async function postQuery(sql) {
   const res = await fetch('/api/query', {
     method: 'POST',

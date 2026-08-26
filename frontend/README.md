@@ -54,18 +54,37 @@ services:
       - backend
 ```
 
+## Flujo CSV
+
+Hay dos formas de trabajar con archivos CSV (ambas usan `multipart/form-data`):
+
+- **Nuevo desde CSV** (botón junto al título "Archivos"): sube un CSV a
+  `POST /api/infer-schema`. Muestra una tarjeta con las columnas detectadas
+  (nombre + tipo, PK resaltada en cyan), hasta 5 filas de muestra y la
+  estimación total de filas. El `CREATE TABLE` sugerido se carga en el editor
+  SQL para revisarlo/editarlo y ejecutarlo; luego se usa "Cargar CSV" en la
+  tabla creada.
+- **Cargar CSV** (botón en cada tabla): sube un CSV a
+  `POST /api/tables/{nombre}/upload-csv`. Al terminar refresca la lista de
+  tablas y muestra el resultado: filas cargadas y tiempo, los primeros errores
+  de filas rechazadas (lista expandible) y las columnas ignoradas, si las
+  hubiera.
+
 ## Estructura
 
 ```
 src/
-  api.js                  # wrappers fetch (/api/health, /api/tables, /api/query)
-  App.jsx                 # layout principal y estado global
+  api.js                      # wrappers fetch (/api/health, /api/tables, /api/query,
+                              #  /api/infer-schema, /api/tables/{n}/upload-csv)
+  App.jsx                     # layout principal y estado global
   components/
-    TopNav.jsx            # barra superior + estado de conexión
-    Sidebar.jsx           # tablas, columnas, índices y archivos físicos
-    SqlEditor.jsx         # editor SQL, ejemplos, Ejecutar/Limpiar
-    StatusMessage.jsx     # errores de la API con badge de etapa
-    ResultsTable.jsx      # tabla de resultados
-    PlanPanel.jsx         # plan de ejecución por pasos
-    MapPanel.jsx          # mapa Leaflet con puntos espaciales
+    TopNav.jsx                # barra superior + estado de conexión
+    Sidebar.jsx               # tablas, columnas, índices, archivos físicos y carga CSV
+    InferSchemaPanel.jsx      # previsualización del esquema inferido de un CSV
+    CsvUploadStatus.jsx       # resultado de la carga CSV por tabla
+    SqlEditor.jsx             # editor SQL, ejemplos, Ejecutar/Limpiar
+    StatusMessage.jsx         # errores de la API con badge de etapa
+    ResultsTable.jsx          # tabla de resultados
+    PlanPanel.jsx             # plan de ejecución por pasos
+    MapPanel.jsx              # mapa Leaflet con puntos espaciales
 ```

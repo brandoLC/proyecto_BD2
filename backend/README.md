@@ -50,6 +50,10 @@ SQL → parser (tokenizer + recursivo descendente, AST)
   (esquemas de tablas e índices), persistido en cada DDL.
 - `app/engine/parser.py` — tokenizer + parser recursivo descendente;
   errores de sintaxis con posición.
+- `app/engine/csv_loader.py` — carga de CSV: detección de delimitador
+  con `csv.Sniffer`, inferencia de esquema muestreando hasta 200 filas,
+  casteo de valores crudos a los tipos del catálogo y mapeo de columnas
+  por nombre de cabecera.
 - `app/engine/executor.py` — ejecuta el AST y devuelve el resultado más
   una lista `plan` de pasos con tiempos (`time_ms`), eligiendo
   *Index Scan* cuando hay índice usable y *Sequential Scan* si no.
@@ -73,9 +77,59 @@ SELECT * | c1, c2 FROM t [WHERE cond] [LIMIT n];
 --   pointcol KNN ((x, y), k)    -- k vecinos más cercanos (R-Tree + min-heap)
 
 DELETE FROM t WHERE col = lit;
+
+CREATE TABLE nombre FROM FILE "archivo.csv";
+-- infiere el esquema del CSV (en DATASETS_DIR), crea la tabla con la PK
+-- sugerida (si la hay) y carga todas las filas válidas a granel
+
+LOAD INTO tabla FROM FILE "archivo.csv";
+-- carga un CSV en una tabla existente, mapeando columnas por nombre
 ```
 
 Keywords case-insensitive y `;` final opcional.
+
+## Carga de archivos CSV
+
+MiniDB puede crear tablas y cargar datos desde archivos CSV.
+Convenciones del formato:
+
+- **Cabecera obligatoria** en la primera línea (nombres de columna); el
+  delimitador se detecta automáticamente (`,`, `;`, tab o `|`, con coma
+  como respaldo) y se respeta el quoting estándar de CSV.
+- **POINT** se escribe `"(lat, lon)"` (o `(x, y)`) con espacios
+  opcionales; como contiene una coma, debe ir entre comillas dobles,
+  p. ej. `"(-12.0464, -77.0428)"`.
+- Los valores vacíos se ignoran al inferir el tipo (null-ish); una
+  columna completamente vacía se infiere como `TEXT`.
+- Inferencia de tipos muestreando hasta 200 filas: enteros → `INT`,
+  numéricos → `FLOAT`, `true/false` → `BOOL`, puntos → `POINT`, resto →
+  `VARCHAR(n)` (n = longitud máxima + 20 %, redondeado a múltiplos de
+  10, mínimo 20) o `TEXT` si supera 255. Si la primera columna es `INT`
+  con valores únicos se sugiere como `PRIMARY KEY`.
+- Los archivos de `FROM FILE` se resuelven dentro de `DATASETS_DIR`
+  (por defecto `./datasets`); se rechazan rutas absolutas y con `..`.
+- **Manejo de errores por fila**: las filas inválidas se *rechazan* sin
+  abortar la carga y se reportan con su número de línea (cabecera =
+  línea 1) y el motivo; se conservan hasta 50 errores. Las columnas del
+  CSV que la tabla no tiene se ignoran y se listan en
+  `ignored_columns`; si falta una columna requerida, toda la carga falla.
+
+### Endpoints CSV
+
+- `POST /api/infer-schema` (multipart, campo `file`, opcional
+  `table_name`) → infiere el esquema sin crear nada:
+  `{"ok", "table_name", "columns": [{"name", "type", "primary_key"}],
+  "suggested_sql", "preview_rows" (5 primeras filas crudas),
+  "total_rows_estimate"}`. En error: `{"ok": false, "error",
+  "stage": "parse"}`.
+- `POST /api/tables/{nombre}/upload-csv` (multipart, campo `file`) →
+  carga el CSV en una tabla existente:
+  `{"ok", "rows_loaded", "rows_rejected", "errors": [{"line", "reason"}],
+  "ignored_columns", "elapsed_ms"}`.
+
+Las filas se insertan por el mismo camino del motor que un `INSERT`
+normal, así que el heap file y todos los índices de la tabla quedan
+actualizados.
 
 ## Ejecutar localmente
 
@@ -117,8 +171,8 @@ python -m pytest tests/ -q
 curl -X POST localhost:8000/api/query -H 'Content-Type: application/json' \
   -d '{"sql": "CREATE TABLE restaurantes (id INT PRIMARY KEY, nombre VARCHAR(50), ubicacion POINT);"}'
 
-curl -X POST localhost:8000/api/query -H 'Content-Type: application/json' \
-  -d '{"sql": "CREATE INDEX idx_id ON restaurantes (id) USING BTREE;"}'
+# Nota: la PRIMARY KEY crea automáticamente un B+ Tree (restaurantes_id_pk),
+# igual que PostgreSQL; no hace falta (ni se permite) otro BTREE sobre id.
 
 curl -X POST localhost:8000/api/query -H 'Content-Type: application/json' \
   -d '{"sql": "CREATE INDEX idx_ubi ON restaurantes (ubicacion) USING RTREE;"}'
@@ -141,6 +195,16 @@ curl -X POST localhost:8000/api/query -H 'Content-Type: application/json' \
 # KNN (R-Tree con cola de prioridad)
 curl -X POST localhost:8000/api/query -H 'Content-Type: application/json' \
   -d '{"sql": "SELECT * FROM restaurantes WHERE ubicacion KNN ((-12.06, -77.03), 3);"}'
+
+# Inferir esquema de un CSV (multipart)
+curl -X POST localhost:8000/api/infer-schema -F "file=@restaurantes.csv"
+
+# Cargar un CSV en una tabla existente
+curl -X POST localhost:8000/api/tables/restaurantes/upload-csv -F "file=@restaurantes.csv"
+
+# Crear y cargar directamente desde DATASETS_DIR
+curl -X POST localhost:8000/api/query -H 'Content-Type: application/json' \
+  -d '{"sql": "CREATE TABLE restaurantes FROM FILE \"restaurantes.csv\";"}'
 
 curl localhost:8000/api/tables
 ```

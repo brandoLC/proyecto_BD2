@@ -1,4 +1,9 @@
 // Panel izquierdo "Archivos": tablas, columnas, índices y archivos físicos.
+// Incluye carga de CSV por tabla y el asistente "Nuevo desde CSV".
+import { useRef, useState } from 'react'
+import CsvUploadStatus from './CsvUploadStatus.jsx'
+import InferSchemaPanel from './InferSchemaPanel.jsx'
+
 function formatBytes(n) {
   if (n == null) return '—'
   if (n < 1024) return `${n} B`
@@ -12,20 +17,78 @@ const INDEX_BADGE = {
   RTREE: 'R-Tree',
 }
 
-export default function Sidebar({ tables, loading, error, onRefresh, onSelectTable }) {
+export default function Sidebar({
+  tables,
+  loading,
+  error,
+  onRefresh,
+  onSelectTable,
+  csvUploads,
+  onUploadCsv,
+  infer,
+  onInfer,
+  onClearInfer,
+}) {
+  const uploadInputRef = useRef(null)
+  const inferInputRef = useRef(null)
+  const [uploadTarget, setUploadTarget] = useState(null) // tabla destino de la carga abierta
+
+  const openUploadPicker = (name) => {
+    setUploadTarget(name)
+    uploadInputRef.current?.click()
+  }
+
+  const handleUploadFile = (e) => {
+    const file = e.target.files?.[0]
+    if (file && uploadTarget) onUploadCsv(uploadTarget, file)
+    e.target.value = '' // permitir re-elegir el mismo archivo
+  }
+
+  const handleInferFile = (e) => {
+    const file = e.target.files?.[0]
+    if (file) onInfer(file)
+    e.target.value = ''
+  }
+
   return (
     <aside className="flex flex-col rounded-card border border-hairline bg-surface p-6 shadow-card">
-      <div className="mb-4 flex items-center justify-between">
+      <input
+        ref={uploadInputRef}
+        type="file"
+        accept=".csv"
+        className="hidden"
+        onChange={handleUploadFile}
+      />
+      <input
+        ref={inferInputRef}
+        type="file"
+        accept=".csv"
+        className="hidden"
+        onChange={handleInferFile}
+      />
+
+      <div className="mb-4 flex items-center justify-between gap-2">
         <h2 className="text-[15px]">Archivos</h2>
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={loading}
-          className="rounded-full border border-hairline px-3 py-1 text-xs text-ink transition-colors hover:bg-canvas disabled:opacity-50"
-        >
-          {loading ? 'Cargando…' : 'Actualizar'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => inferInputRef.current?.click()}
+            className="rounded-full border border-hairline px-3 py-1 text-xs text-ink transition-colors hover:bg-canvas"
+          >
+            Nuevo desde CSV
+          </button>
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={loading}
+            className="rounded-full border border-hairline px-3 py-1 text-xs text-ink transition-colors hover:bg-canvas disabled:opacity-50"
+          >
+            {loading ? 'Cargando…' : 'Actualizar'}
+          </button>
+        </div>
       </div>
+
+      <InferSchemaPanel infer={infer} onClose={onClearInfer} />
 
       {error && (
         <p className="mb-3 rounded-input border border-error/40 bg-error/5 px-3 py-2 text-xs text-error">
@@ -83,6 +146,36 @@ export default function Sidebar({ tables, loading, error, onRefresh, onSelectTab
                 ))}
               </div>
             )}
+
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => openUploadPicker(t.name)}
+                disabled={csvUploads?.[t.name]?.loading}
+                title={`Cargar un archivo CSV en ${t.name}`}
+                className="inline-flex items-center gap-1.5 rounded-full border border-hairline px-3 py-1 text-xs text-ink transition-colors hover:bg-canvas disabled:opacity-50"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-3.5 w-3.5"
+                  aria-hidden="true"
+                >
+                  <path d="M12 16V4m0 0l-4 4m4-4l4 4" />
+                  <path d="M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3" />
+                </svg>
+                {csvUploads?.[t.name]?.loading ? 'Cargando…' : 'Cargar CSV'}
+              </button>
+              {csvUploads?.[t.name]?.loading && (
+                <span className="h-3 w-3 animate-spin rounded-full border border-helper border-t-transparent" />
+              )}
+            </div>
+
+            <CsvUploadStatus status={csvUploads?.[t.name]} />
           </div>
         ))}
       </div>

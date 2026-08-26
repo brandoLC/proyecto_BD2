@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getHealth, getTables, postQuery } from './api.js'
+import { getHealth, getTables, inferSchema, postQuery, uploadCsv } from './api.js'
 import TopNav from './components/TopNav.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import SqlEditor from './components/SqlEditor.jsx'
@@ -22,6 +22,10 @@ export default function App() {
   const [queryError, setQueryError] = useState(null) // {error, stage} de ok:false
   const [lastSql, setLastSql] = useState('') // SQL que produjo `result`
   const [tab, setTab] = useState('Resultados')
+
+  // CSV: resultado/estado de carga por tabla, y estado del asistente "Nuevo desde CSV".
+  const [csvUploads, setCsvUploads] = useState({}) // { [tabla]: {loading?, result?, error?} }
+  const [infer, setInfer] = useState(null) // null | {loading} | {data} | {error:{error,stage}}
 
   const checkHealth = useCallback(async () => {
     try {
@@ -92,6 +96,48 @@ export default function App() {
     [],
   )
 
+  const uploadCsvToTable = useCallback(
+    async (name, file) => {
+      if (!file) return
+      setCsvUploads((prev) => ({ ...prev, [name]: { loading: true } }))
+      try {
+        const data = await uploadCsv(name, file)
+        if (data.ok) {
+          setCsvUploads((prev) => ({ ...prev, [name]: { result: data } }))
+          loadTables() // cambia el rowcount
+        } else {
+          setCsvUploads((prev) => ({
+            ...prev,
+            [name]: { error: { error: data.error || 'Error desconocido', stage: data.stage } },
+          }))
+        }
+      } catch (e) {
+        setCsvUploads((prev) => ({
+          ...prev,
+          [name]: { error: { error: `Error de red: ${e.message}`, stage: null } },
+        }))
+      }
+    },
+    [loadTables],
+  )
+
+  const inferFromCsv = useCallback(async (file) => {
+    if (!file) return
+    setInfer({ loading: true })
+    try {
+      const data = await inferSchema(file)
+      if (data.ok) {
+        setInfer({ data })
+        setSql(data.suggested_sql) // cargar el CREATE TABLE sugerido en el editor
+        setQueryError(null)
+      } else {
+        setInfer({ error: { error: data.error || 'Error desconocido', stage: data.stage } })
+      }
+    } catch (e) {
+      setInfer({ error: { error: `Error de red: ${e.message}`, stage: null } })
+    }
+  }, [])
+
   return (
     <div className="min-h-screen bg-canvas">
       <TopNav health={health} />
@@ -104,6 +150,11 @@ export default function App() {
             error={tablesError}
             onRefresh={loadTables}
             onSelectTable={selectTable}
+            csvUploads={csvUploads}
+            onUploadCsv={uploadCsvToTable}
+            infer={infer}
+            onInfer={inferFromCsv}
+            onClearInfer={() => setInfer(null)}
           />
 
           <div className="flex flex-col gap-5">

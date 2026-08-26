@@ -30,6 +30,17 @@ from ..storage.record import (
     serialize_row,
 )
 from .catalog import Catalog
+from .csv_loader import (
+    CSVError,
+    MAX_ERRORS,
+    cast_csv_value,
+    decode_csv_bytes,
+    infer_columns,
+    map_columns,
+    read_csv,
+    reorder_row,
+    resolve_dataset_path,
+)
 from .parser import ParseError, parse
 
 
@@ -141,10 +152,14 @@ class Engine:
         kind = ast["type"]
         if kind == "create_table":
             return self._exec_create_table(ast, plan)
+        if kind == "create_table_from_file":
+            return self._exec_create_table_from_file(ast, plan)
         if kind == "create_index":
             return self._exec_create_index(ast, plan)
         if kind == "insert":
             return self._exec_insert(ast, plan)
+        if kind == "load_file":
+            return self._exec_load_file(ast, plan)
         if kind == "select":
             return self._exec_select(ast, plan)
         if kind == "delete":
@@ -190,8 +205,115 @@ class Engine:
         t = time.perf_counter()
         self.catalog.create_table(table, columns)
         plan.add("Update Catalog", "catalog.json persistido", t)
+        self._create_pk_index(table, columns, plan)
         return {"kind": "create_table",
                 "message": f"Tabla '{table}' creada"}
+
+    def _create_pk_index(self, table: str, columns: list[Column],
+                         plan: _Plan) -> None:
+        """Crea automáticamente un B+ Tree para la PRIMARY KEY.
+
+        Igual que PostgreSQL, toda PK lleva su índice; además evita que la
+        verificación de unicidad en INSERT degrade a un escaneo O(n) por fila.
+        """
+        pk = next((c for c in columns if c.primary_key), None)
+        if pk is None or pk.type == TYPE_POINT:
+            return
+        t = time.perf_counter()
+        idx = self._open_btree(table, pk, create=True)
+        idx.close()
+        self.catalog.add_index(table, f"{table}_{pk.name}_pk", pk.name, "BTREE")
+        plan.add("Create PK Index",
+                 f"BTREE automático sobre {table}.{pk.name}", t)
+
+    # ------------------------------------------------------------------
+    # CREATE TABLE ... FROM FILE / LOAD INTO ... FROM FILE
+    # ------------------------------------------------------------------
+    def _read_dataset_csv(self, filename: str) -> tuple[list[str],
+                                                        list[tuple[int,
+                                                              list[str]]]]:
+        """Lee un CSV de ``DATASETS_DIR`` (defecto ``./datasets``)."""
+        try:
+            path = resolve_dataset_path(
+                os.environ.get("DATASETS_DIR", "./datasets"), filename)
+        except ValueError as exc:
+            raise SemanticError(str(exc)) from exc
+        if not os.path.isfile(path):
+            raise ExecutionError(
+                f"el archivo '{filename}' no existe en DATASETS_DIR")
+        with open(path, "rb") as f:
+            text = decode_csv_bytes(f.read())
+        try:
+            return read_csv(text)
+        except CSVError as exc:
+            raise ExecutionError(str(exc)) from exc
+
+    def _exec_create_table_from_file(self, ast: dict, plan: _Plan) -> dict:
+        table, filename = ast["table"], ast["file"]
+        t = time.perf_counter()
+        if self.catalog.has_table(table):
+            raise SemanticError(f"la tabla '{table}' ya existe")
+        plan.add("Semantic Check", f"'{table}' no existe aún", t)
+
+        t = time.perf_counter()
+        header, rows = self._read_dataset_csv(filename)
+        columns = infer_columns(header, [r for _, r in rows])
+        pk = next((c.name for c in columns if c.primary_key), None)
+        plan.add("Infer Schema",
+                 f"{len(columns)} columnas inferidas de '{filename}'"
+                 + (f", PK sugerida: {pk}" if pk else ""), t)
+
+        t = time.perf_counter()
+        heap = self._open_heap(table, create=True)
+        heap.close()
+        plan.add("Create Heap File", os.path.basename(self._heap_path(table)), t)
+
+        t = time.perf_counter()
+        self.catalog.create_table(table, columns)
+        plan.add("Update Catalog", "catalog.json persistido", t)
+        self._create_pk_index(table, columns, plan)
+
+        t = time.perf_counter()
+        stats = self.bulk_load_rows(table, rows)
+        plan.add("Bulk Load",
+                 f"{stats['rows_loaded']} filas cargadas, "
+                 f"{stats['rows_rejected']} rechazadas desde '{filename}'", t)
+        return {"kind": "create_table",
+                "message": f"Tabla '{table}' creada desde {filename}: "
+                           f"{stats['rows_loaded']} filas cargadas, "
+                           f"{stats['rows_rejected']} rechazadas",
+                "load_errors": stats["errors"]}
+
+    def _exec_load_file(self, ast: dict, plan: _Plan) -> dict:
+        table, filename = ast["table"], ast["file"]
+        t = time.perf_counter()
+        columns = self._get_columns(table)
+        plan.add("Semantic Check", f"tabla '{table}' válida", t)
+
+        t = time.perf_counter()
+        header, rows = self._read_dataset_csv(filename)
+        try:
+            positions, ignored = map_columns(header, columns)
+        except ValueError as exc:
+            raise SemanticError(str(exc)) from exc
+        plan.add("Map Columns",
+                 f"{len(positions)} columnas mapeadas por nombre"
+                 + (f", ignoradas: {', '.join(ignored)}" if ignored else ""),
+                 t)
+
+        t = time.perf_counter()
+        mapped = [(ln, reorder_row(raw, positions)) for ln, raw in rows]
+        stats = self.bulk_load_rows(table, mapped)
+        plan.add("Bulk Load",
+                 f"{stats['rows_loaded']} filas cargadas, "
+                 f"{stats['rows_rejected']} rechazadas desde '{filename}'", t)
+        return {"kind": "insert",
+                "rowcount": stats["rows_loaded"],
+                "message": f"{stats['rows_loaded']} filas cargadas en "
+                           f"'{table}' desde {filename} "
+                           f"({stats['rows_rejected']} rechazadas)",
+                "load_errors": stats["errors"],
+                "ignored_columns": ignored}
 
     # ------------------------------------------------------------------
     # CREATE INDEX
@@ -260,7 +382,16 @@ class Engine:
         row = [coerce_value(v, c) for v, c in zip(ast["values"], columns)]
         plan.add("Semantic Check", f"tipos válidos para '{table}'", t)
 
-        # Unicidad de la PRIMARY KEY
+        self._insert_row(table, columns, row, plan)
+        return {"kind": "insert", "rowcount": 1, "message": "1 registro insertado"}
+
+    def _insert_row(self, table: str, columns: list[Column], row: list,
+                    plan: _Plan | None = None) -> RID:
+        """Inserta una fila validada manteniendo heap file e índices.
+
+        Verifica la unicidad de la PRIMARY KEY (índice si existe, si no
+        escaneo secuencial) y devuelve el RID asignado.
+        """
         pk = self.catalog.primary_key(table)
         if pk is not None:
             t = time.perf_counter()
@@ -272,8 +403,9 @@ class Engine:
                        else self._open_hash(table, pk))
                 found = idx.search(value)
                 idx.close()
-                plan.add("Index Lookup",
-                         f"USING {idx_meta['type']} ON {table}.{pk.name}", t)
+                if plan is not None:
+                    plan.add("Index Lookup",
+                             f"USING {idx_meta['type']} ON {table}.{pk.name}", t)
             else:
                 heap = self._open_heap(table)
                 found = []
@@ -281,8 +413,9 @@ class Engine:
                     if deserialize_row(columns, raw)[pk_pos] == value:
                         found.append(rid)
                 heap.close()
-                plan.add("Sequential Scan",
-                         f"verificación de PK en {table}.{pk.name}", t)
+                if plan is not None:
+                    plan.add("Sequential Scan",
+                             f"verificación de PK en {table}.{pk.name}", t)
             if found:
                 raise ExecutionError(
                     f"clave primaria duplicada: {pk.name} = {value!r}")
@@ -291,7 +424,8 @@ class Engine:
         heap = self._open_heap(table)
         rid = heap.insert(serialize_row(columns, row))
         heap.close()
-        plan.add("Heap Insert", f"RID = ({rid[0]}, {rid[1]})", t)
+        if plan is not None:
+            plan.add("Heap Insert", f"RID = ({rid[0]}, {rid[1]})", t)
 
         for meta in self.catalog.indexes(table):
             t = time.perf_counter()
@@ -306,10 +440,45 @@ class Engine:
                 idx = self._open_rtree(table, col)
             idx.insert(tuple(value) if col.type == TYPE_POINT else value, rid)
             idx.close()
-            plan.add("Index Maintenance",
-                     f"{meta['type']} ON {table}.{col.name} actualizado", t)
+            if plan is not None:
+                plan.add("Index Maintenance",
+                         f"{meta['type']} ON {table}.{col.name} actualizado", t)
+        return rid
 
-        return {"kind": "insert", "rowcount": 1, "message": "1 registro insertado"}
+    def bulk_load_rows(self, table: str,
+                       rows: list[tuple[int, list[str]]]) -> dict:
+        """Carga masiva de filas crudas (strings) en una tabla existente.
+
+        Cada elemento es ``(número de línea, valores crudos)`` ya
+        ordenados según las columnas de la tabla. Las filas inválidas se
+        rechazan sin abortar la carga; se conservan hasta ``MAX_ERRORS``
+        errores con su número de línea.
+        """
+        columns = self._get_columns(table)
+        loaded = rejected = 0
+        errors: list[dict] = []
+        for line_no, raw_row in rows:
+            if len(raw_row) != len(columns):
+                rejected += 1
+                if len(errors) < MAX_ERRORS:
+                    errors.append({
+                        "line": line_no,
+                        "reason": f"se esperaban {len(columns)} valores, "
+                                  f"llegaron {len(raw_row)}",
+                    })
+                continue
+            try:
+                row = [cast_csv_value(v, c)
+                       for v, c in zip(raw_row, columns)]
+                self._insert_row(table, columns, row)
+            except (ValueError, SerializationError, ExecutionError) as exc:
+                rejected += 1
+                if len(errors) < MAX_ERRORS:
+                    errors.append({"line": line_no, "reason": str(exc)})
+                continue
+            loaded += 1
+        return {"rows_loaded": loaded, "rows_rejected": rejected,
+                "errors": errors}
 
     # ------------------------------------------------------------------
     # SELECT

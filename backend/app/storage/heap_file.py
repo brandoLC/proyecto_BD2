@@ -22,7 +22,7 @@ from typing import Iterator
 from .page import PAGE_SIZE, PageFullError, SlottedPage
 
 MAGIC = b"HEAP"
-HEADER_FMT = "<4sIIH"  # magic, page_count, row_count, free_count
+HEADER_FMT = "<4sIIHI"  # magic, page_count, row_count, free_count, dropped_free
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 FREE_ENTRY_FMT = "<IH"  # page_id, slot_id
@@ -43,6 +43,7 @@ class HeapFile:
             self.page_count = 1  # página 0 = cabecera
             self.row_count = 0
             self.free_list: list[RID] = []
+            self.dropped_free = 0  # slots muertos que no cupieron en la lista
             self._file = open(path, "w+b")
             self._write_header()
         else:
@@ -57,9 +58,8 @@ class HeapFile:
         data = self._file.read(PAGE_SIZE)
         if len(data) < PAGE_SIZE or data[:4] != MAGIC:
             raise ValueError(f"{self.path} no es un heap file válido")
-        _, self.page_count, self.row_count, free_count = struct.unpack_from(
-            HEADER_FMT, data, 0
-        )
+        _, self.page_count, self.row_count, free_count, self.dropped_free = \
+            struct.unpack_from(HEADER_FMT, data, 0)
         self.free_list = []
         for i in range(free_count):
             page_id, slot_id = struct.unpack_from(
@@ -71,7 +71,7 @@ class HeapFile:
         buf = bytearray(PAGE_SIZE)
         struct.pack_into(
             HEADER_FMT, buf, 0, MAGIC, self.page_count, self.row_count,
-            len(self.free_list),
+            len(self.free_list), self.dropped_free,
         )
         for i, (page_id, slot_id) in enumerate(self.free_list):
             struct.pack_into(
@@ -124,10 +124,13 @@ class HeapFile:
             except PageFullError:
                 continue  # el slot muerto no acomoda este registro
 
-        # 2) escaneo de respaldo: páginas con slots muertos
-        rid = self._scan_dead_slot(record)
-        if rid is not None:
-            return rid
+        # 2) escaneo de respaldo: solo si la lista de libres desbordó
+        #    (hay slots muertos sin registrar); si no, es O(páginas) en vano
+        if self.dropped_free:
+            rid = self._scan_dead_slot(record)
+            if rid is not None:
+                self.dropped_free -= 1
+                return rid
 
         # 3) última página
         if self.page_count > 1:
@@ -179,6 +182,8 @@ class HeapFile:
         self.row_count -= 1
         if len(self.free_list) < MAX_FREE:
             self.free_list.append(rid)
+        else:
+            self.dropped_free += 1  # slot muerto sin registrar: hay que buscarlo luego
         self._write_header()
 
     def scan(self) -> Iterator[tuple[RID, bytes]]:

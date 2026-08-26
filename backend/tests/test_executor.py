@@ -27,8 +27,10 @@ class TestFlujoCompleto:
         assert r["ok"] and r["kind"] == "create_table"
         assert "Parse SQL" in plan_names(r)
 
+        # La PK ya trae un B+ Tree automático (rest_id_pk); crear otro
+        # BTREE sobre la misma columna se rechaza como duplicado.
         r = q(engine, "CREATE INDEX idx_id ON rest (id) USING BTREE;")
-        assert r["ok"] and r["kind"] == "create_index"
+        assert not r["ok"] and "ya existe" in r["error"]
         r = q(engine, "CREATE INDEX idx_nom ON rest (nombre) USING HASH;")
         assert r["ok"]
         r = q(engine, "CREATE INDEX idx_ubi ON rest (ubicacion) USING RTREE;")
@@ -146,7 +148,6 @@ class TestFlujoCompleto:
 
     def test_table_info(self, engine):
         q(engine, "CREATE TABLE t (id INT PRIMARY KEY, p POINT);")
-        q(engine, "CREATE INDEX ON t (id) USING BTREE;")
         q(engine, "INSERT INTO t VALUES (1, (1.0, 2.0));")
         info = engine.table_info()
         assert len(info) == 1
@@ -156,7 +157,8 @@ class TestFlujoCompleto:
         assert t["columns"][0] == {"name": "id", "type": "INT",
                                    "primary_key": True}
         assert t["columns"][1]["type"] == "POINT"
-        assert t["indexes"] == [{"name": "t_id_btree", "column": "id",
+        # Índice B+ Tree automático de la PRIMARY KEY
+        assert t["indexes"] == [{"name": "t_id_pk", "column": "id",
                                  "type": "BTREE"}]
         assert len(t["files"]) == 2
         for f in t["files"]:
@@ -167,7 +169,6 @@ class TestFlujoCompleto:
         data = str(tmp_path / "data")
         e1 = Engine(data)
         q(e1, "CREATE TABLE t (id INT PRIMARY KEY);")
-        q(e1, "CREATE INDEX ON t (id) USING BTREE;")
         q(e1, "INSERT INTO t VALUES (42);")
         e2 = Engine(data)  # recarga el catálogo desde disco
         r = q(e2, "SELECT * FROM t WHERE id = 42;")
