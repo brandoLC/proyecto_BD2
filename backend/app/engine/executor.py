@@ -164,7 +164,37 @@ class Engine:
             return self._exec_select(ast, plan)
         if kind == "delete":
             return self._exec_delete(ast, plan)
+        if kind == "drop_table":
+            return self._exec_drop_table(ast, plan)
         raise ExecutionError(f"sentencia no soportada: {kind}")
+
+    # ------------------------------------------------------------------
+    # DROP TABLE
+    # ------------------------------------------------------------------
+    def _exec_drop_table(self, ast: dict, plan: _Plan) -> dict:
+        table = ast["table"]
+        t = time.perf_counter()
+        if not self.catalog.has_table(table):
+            raise SemanticError(f"la tabla '{table}' no existe")
+        plan.add("Semantic Check", f"'{table}' existe", t)
+
+        t = time.perf_counter()
+        paths = [self._heap_path(table)]
+        for meta in self.catalog.indexes(table):
+            paths.append(self._index_path(table, meta["column"],
+                                          meta["type"]))
+        removed = 0
+        for p in paths:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed += 1
+        plan.add("Drop Files", f"{removed} archivos eliminados de disco", t)
+
+        t = time.perf_counter()
+        self.catalog.drop_table(table)
+        plan.add("Update Catalog", "catalog.json persistido", t)
+        return {"kind": "drop_table",
+                "message": f"Tabla '{table}' eliminada"}
 
     # ------------------------------------------------------------------
     # Utilidades semánticas

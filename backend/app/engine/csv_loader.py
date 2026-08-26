@@ -106,6 +106,15 @@ def sanitize_identifier(name: str) -> str:
     return s
 
 
+def _varchar_size(max_len: int) -> tuple[str, int | None]:
+    """VARCHAR(n) con 20% de margen redondeado a decenas; TEXT si excede 255."""
+    n = math.ceil(max_len * 1.2)
+    n = max(20, math.ceil(n / 10) * 10)
+    if n > 255:
+        return TYPE_TEXT, None
+    return TYPE_VARCHAR, n
+
+
 def _infer_type(values: list[str]) -> tuple[str, int | None]:
     """Tipo de columna a partir de sus valores no vacíos del muestreo."""
     if not values:
@@ -118,16 +127,17 @@ def _infer_type(values: list[str]) -> tuple[str, int | None]:
         return TYPE_BOOL, None
     if all(POINT_RE.match(v) for v in values):
         return TYPE_POINT, None
-    n = math.ceil(max(len(v) for v in values) * 1.2)
-    n = max(20, math.ceil(n / 10) * 10)
-    if n > 255:
-        return TYPE_TEXT, None
-    return TYPE_VARCHAR, n
+    return _varchar_size(max(len(v) for v in values))
 
 
 def infer_columns(header: list[str], rows: list[list[str]],
                   sample_limit: int = MAX_SAMPLE_ROWS) -> list[Column]:
-    """Infiere las columnas muestreando hasta ``sample_limit`` filas."""
+    """Infiere las columnas muestreando hasta ``sample_limit`` filas.
+
+    La detección de tipo (INT/FLOAT/BOOL/POINT) usa el muestreo, pero el
+    tamaño de los VARCHAR se calcula con el valor más largo de TODO el
+    archivo: un muestreo corto subestima y la carga rechazaría filas.
+    """
     sample = [r for r in rows[:sample_limit] if len(r) == len(header)]
     used: set[str] = set()
     columns: list[Column] = []
@@ -141,6 +151,10 @@ def infer_columns(header: list[str], rows: list[list[str]],
             ident = f"{ident}_{k}"
         used.add(ident)
         ctype, size = _infer_type(values)
+        if ctype == TYPE_VARCHAR:
+            full_max = max((len(r[j].strip()) for r in rows
+                            if len(r) == len(header)), default=0)
+            ctype, size = _varchar_size(full_max)
         columns.append(Column(ident, ctype, size))
     # PRIMARY KEY sugerida: primera columna INT con valores únicos
     if columns and columns[0].type == TYPE_INT:

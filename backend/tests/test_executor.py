@@ -165,6 +165,30 @@ class TestFlujoCompleto:
             assert f["size_bytes"] > 0 and f["pages"] >= 1
             assert f["size_bytes"] % 4096 == 0
 
+    def test_drop_table(self, engine, tmp_path):
+        q(engine, "CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(20));")
+        q(engine, "CREATE INDEX ON t (v) USING HASH;")
+        q(engine, "INSERT INTO t VALUES (1, 'a');")
+        heap = tmp_path / "data" / "t.heap"
+        idx_pk = tmp_path / "data" / "t_id.btree"
+        idx_v = tmp_path / "data" / "t_v.hash"
+        assert heap.exists() and idx_pk.exists() and idx_v.exists()
+
+        r = q(engine, "DROP TABLE t;")
+        assert r["ok"] and r["kind"] == "drop_table"
+        assert not heap.exists() and not idx_pk.exists() and not idx_v.exists()
+        assert engine.table_info() == []
+
+        # consultar la tabla eliminada -> error semántico
+        r = q(engine, "SELECT * FROM t;")
+        assert not r["ok"] and r["stage"] == "semantic"
+        # eliminarla de nuevo -> error semántico
+        r = q(engine, "DROP TABLE t;")
+        assert not r["ok"] and r["stage"] == "semantic"
+        # se puede recrear con el mismo nombre (flujo CSV: drop + recreate)
+        r = q(engine, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT);")
+        assert r["ok"]
+
     def test_persistencia_entre_instancias(self, tmp_path):
         data = str(tmp_path / "data")
         e1 = Engine(data)

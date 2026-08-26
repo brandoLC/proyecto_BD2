@@ -51,6 +51,10 @@ class Catalog:
         }
         self._save()
 
+    def drop_table(self, name: str) -> None:
+        del self._data["tables"][name]
+        self._save()
+
     def columns(self, table: str) -> list[Column]:
         return [Column.from_dict(d) for d in self._data["tables"][table]["columns"]]
 

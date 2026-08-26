@@ -86,7 +86,8 @@ class TestRechazo:
         "SELECT * FROM t WHERE p KNN ((1,2), 0)",
         "CREATE TABLE t (a VARCHAR)",
         "SELECT * FROM t WHERE a = 1 extra",
-        "DROP TABLE t",
+        "DROP TABLE",
+        "DROP t",
     ])
     def test_sentencias_invalidas(self, sql):
         with pytest.raises(ParseError):

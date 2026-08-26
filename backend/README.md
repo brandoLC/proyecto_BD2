@@ -84,6 +84,10 @@ CREATE TABLE nombre FROM FILE "archivo.csv";
 
 LOAD INTO tabla FROM FILE "archivo.csv";
 -- carga un CSV en una tabla existente, mapeando columnas por nombre
+
+DROP TABLE t;
+-- elimina la tabla: borra el heap file y sus índices de disco y la saca
+-- del catálogo (útil para re-crear y re-cargar un CSV)
 ```
 
 Keywords case-insensitive y `;` final opcional.
@@ -103,9 +107,11 @@ Convenciones del formato:
   columna completamente vacía se infiere como `TEXT`.
 - Inferencia de tipos muestreando hasta 200 filas: enteros → `INT`,
   numéricos → `FLOAT`, `true/false` → `BOOL`, puntos → `POINT`, resto →
-  `VARCHAR(n)` (n = longitud máxima + 20 %, redondeado a múltiplos de
-  10, mínimo 20) o `TEXT` si supera 255. Si la primera columna es `INT`
-  con valores únicos se sugiere como `PRIMARY KEY`.
+  `VARCHAR(n)` o `TEXT` si supera 255. El tamaño `n` se calcula con la
+  longitud máxima de **todo el archivo** (+20 %, redondeado a múltiplos
+  de 10, mínimo 20), no solo del muestreo, para no rechazar filas largas
+  que aparezcan más abajo. Si la primera columna es `INT` con valores
+  únicos se sugiere como `PRIMARY KEY`.
 - Los archivos de `FROM FILE` se resuelven dentro de `DATASETS_DIR`
   (por defecto `./datasets`); se rechazan rutas absolutas y con `..`.
 - **Manejo de errores por fila**: las filas inválidas se *rechazan* sin

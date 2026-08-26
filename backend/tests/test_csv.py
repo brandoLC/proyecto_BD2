@@ -75,6 +75,14 @@ class TestInferencia:
         cols = infer_columns(["s"], [["x" * 300]])
         assert cols[0].type == "TEXT"
 
+    def test_varchar_sizing_usa_todo_el_archivo(self):
+        # El valor largo está FUERA del muestreo de 200 filas: el tamaño
+        # debe calcularse con el máximo del archivo completo.
+        rows = [["corto"]] * 250 + [["x" * 180]]
+        cols = infer_columns(["s"], rows)
+        # 180 * 1.2 = 216 -> VARCHAR(220); con muestreo sería VARCHAR(20)
+        assert cols[0].type == "VARCHAR" and cols[0].size == 220
+
     def test_columna_vacia_es_text(self):
         cols = infer_columns(["a", "b"], [["1", ""], ["2", "  "]])
         assert cols[0].type == "INT"

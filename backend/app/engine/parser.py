@@ -3,7 +3,7 @@
 Gramática soportada (keywords case-insensitive, ';' final opcional)::
 
     statement   := create_table | create_index | insert | select | delete
-                 | load_file
+                 | load_file | drop_table
     create_table:= CREATE TABLE ident '(' col_def (',' col_def)* ')'
                  | CREATE TABLE ident FROM FILE STRING
     col_def     := ident type [PRIMARY KEY]
@@ -20,6 +20,7 @@ Gramática soportada (keywords case-insensitive, ';' final opcional)::
                  | ident KNN '(' point ',' num ')'        (k vecinos)
     delete      := DELETE FROM ident WHERE ident '=' literal
     load_file   := LOAD INTO ident FROM FILE STRING
+    drop_table  := DROP TABLE ident
 
 El AST se representa con diccionarios. Los errores de sintaxis llevan la
 posición (offset en caracteres) dentro del mensaje.
@@ -34,7 +35,7 @@ KEYWORDS = {
     "BOOL", "POINT", "INDEX", "ON", "USING", "BTREE", "HASH", "RTREE",
     "INSERT", "INTO", "VALUES", "SELECT", "FROM", "WHERE", "LIMIT",
     "BETWEEN", "AND", "IN", "KNN", "DELETE", "TRUE", "FALSE",
-    "FILE", "LOAD",
+    "FILE", "LOAD", "DROP",
 }
 
 TOKEN_RE = re.compile(
@@ -163,6 +164,8 @@ class Parser:
             stmt = self._parse_delete()
         elif tok.value == "LOAD":
             stmt = self._parse_load()
+        elif tok.value == "DROP":
+            stmt = self._parse_drop()
         else:
             raise ParseError(f"sentencia no soportada: {tok.value}", tok.pos)
         tok = self.peek()
@@ -396,6 +399,14 @@ class Parser:
         self.expect_kw("FILE")
         return {"type": "load_file", "table": table,
                 "file": self._parse_string()}
+
+    # ------------------------------------------------------------------
+    # DROP TABLE
+    # ------------------------------------------------------------------
+    def _parse_drop(self) -> dict:
+        self.expect_kw("DROP")
+        self.expect_kw("TABLE")
+        return {"type": "drop_table", "table": self.expect_ident()}
 
 
 def parse(sql: str) -> dict:
