@@ -12,9 +12,14 @@ Convenciones del CSV soportado:
 La inferencia muestrea hasta ``MAX_SAMPLE_ROWS`` filas: si todos los
 valores no vacíos son enteros el tipo es ``INT``; si todos son numéricos,
 ``FLOAT``; si todos son ``true/false``, ``BOOL``; si todos son puntos,
-``POINT``; en otro caso ``VARCHAR(n)`` con un 20 % de holgura redondeado
-a múltiplos de 10 (mínimo 20), o ``TEXT`` si supera 255. Se sugiere
-PRIMARY KEY cuando la primera columna es ``INT`` con valores únicos.
+``POINT``; en otro caso ``VARCHAR(n)``. Los tipos numéricos se verifican
+luego contra TODO el archivo y degradan a ``VARCHAR`` si aparece un valor
+que no casa (p. ej. códigos postales ZIP+4 ``"39452-6632"``); los valores
+con ceros a la izquierda (``"05301"``) nunca se infieren como números.
+El tamaño de ``VARCHAR(n)`` usa la longitud máxima de todo el archivo
+con un 20 % de holgura redondeado a múltiplos de 10 (mínimo 20), o
+``TEXT`` si supera 255. Se sugiere PRIMARY KEY cuando la primera columna
+es ``INT`` con valores únicos.
 """
 
 from __future__ import annotations
@@ -42,9 +47,15 @@ BOOL_RE = re.compile(r"^(?:true|false)$", re.IGNORECASE)
 POINT_RE = re.compile(
     r"^\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)$"
 )
+LEADING_ZERO_RE = re.compile(r"^-?0\d")  # "05301" es identificador, no número
 
 MAX_SAMPLE_ROWS = 200
 MAX_ERRORS = 50
+
+
+def _matches(regex: re.Pattern, v: str) -> bool:
+    """``regex`` casa con ``v`` y sin ceros a la izquierda (son códigos)."""
+    return bool(regex.match(v)) and not LEADING_ZERO_RE.match(v)
 
 
 class CSVError(Exception):
@@ -119,9 +130,9 @@ def _infer_type(values: list[str]) -> tuple[str, int | None]:
     """Tipo de columna a partir de sus valores no vacíos del muestreo."""
     if not values:
         return TYPE_TEXT, None
-    if all(INT_RE.match(v) for v in values):
+    if all(_matches(INT_RE, v) for v in values):
         return TYPE_INT, None
-    if all(FLOAT_RE.match(v) for v in values):
+    if all(_matches(FLOAT_RE, v) for v in values):
         return TYPE_FLOAT, None
     if all(BOOL_RE.match(v) for v in values):
         return TYPE_BOOL, None
@@ -151,7 +162,18 @@ def infer_columns(header: list[str], rows: list[list[str]],
             ident = f"{ident}_{k}"
         used.add(ident)
         ctype, size = _infer_type(values)
-        if ctype == TYPE_VARCHAR:
+        if ctype in (TYPE_INT, TYPE_FLOAT):
+            # Verificación contra TODO el archivo (estilo pandas): si hay
+            # valores fuera del muestreo que no casan (p. ej. códigos
+            # postales ZIP+4 "39452-6632"), la columna degrada a VARCHAR
+            # en vez de rechazar filas legítimas al cargar.
+            regex = INT_RE if ctype == TYPE_INT else FLOAT_RE
+            full = [r[j].strip() for r in rows
+                    if len(r) == len(header) and r[j].strip() != ""]
+            if not all(_matches(regex, v) for v in full):
+                ctype, size = _varchar_size(
+                    max((len(v) for v in full), default=0))
+        elif ctype == TYPE_VARCHAR:
             full_max = max((len(r[j].strip()) for r in rows
                             if len(r) == len(header)), default=0)
             ctype, size = _varchar_size(full_max)

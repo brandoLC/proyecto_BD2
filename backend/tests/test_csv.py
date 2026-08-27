@@ -98,6 +98,23 @@ class TestInferencia:
         cols = infer_columns(["nom", "id"], [["a", "1"], ["b", "2"]])
         assert all(not c.primary_key for c in cols)
 
+    def test_ceros_a_la_izquierda_no_son_numeros(self):
+        # "05301" es un código postal: VARCHAR, no INT (evita perder el 0)
+        cols = infer_columns(["zip"], [["05301"], ["13662"]])
+        assert cols[0].type == "VARCHAR"
+
+    def test_numerico_con_violacion_tardia_degrada_a_varchar(self):
+        # 250 filas de enteros limpios y un ZIP+4 al final (fuera del
+        # muestreo): la columna debe degradar a VARCHAR, no rechazar filas
+        rows = [[str(i)] for i in range(250)] + [["39452-6632"]]
+        cols = infer_columns(["postalcode"], rows)
+        assert cols[0].type == "VARCHAR"
+
+    def test_numerico_limpio_en_todo_el_archivo_sigue_int(self):
+        rows = [[str(i)] for i in range(500)]
+        cols = infer_columns(["n"], rows)
+        assert cols[0].type == "INT"
+
     def test_valores_vacios_no_descalifican(self):
         cols = infer_columns(["id"], [["1"], [""], ["2"]])
         assert cols[0].type == "INT" and cols[0].primary_key is True
