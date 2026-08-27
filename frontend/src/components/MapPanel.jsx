@@ -14,11 +14,18 @@ const cartoUrl = (style) =>
   `https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png` +
   (CARTO_KEY ? `?key=${CARTO_KEY}` : '')
 
-// Tiles según el tema: OSM estándar en claro, CartoDB dark en oscuro.
+// Tiles según el tema: CARTO Positron (grises, estilo editorial) en claro,
+// CartoDB Dark Matter en oscuro. Con key de CARTO van sin marca de agua;
+// sin key, el modo claro cae a OSM (gratis, sin watermark) y el oscuro
+// queda con watermark.
 const TILES = {
   light: {
-    url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    url: CARTO_KEY
+      ? cartoUrl('light_all')
+      : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: CARTO_KEY
+      ? '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+      : '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
   },
   dark: {
     url: cartoUrl('dark_all'),
