@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   /* Colores — sistema Seline adaptado */
   --color-canvas: #fafaf9; /* fondo de página, warm stone */
@@ -28,6 +30,21 @@
   --radius-input: 6px;
 }
 
+/* Modo oscuro: misma escala warm-stone invertida. Las utilidades leen
+   var(--color-*), así que basta redefinir las variables para invertir la UI. */
+.dark {
+  --color-canvas: #0c0a09;
+  --color-surface: #1c1917;
+  --color-hairline: #292524;
+  --color-border-strong: #44403c;
+  --color-helper: #78716c;
+  --color-body: #a8a29e;
+  --color-ink: #fafaf9;
+  --color-dark: #fafaf9; /* superficie "invertida" pasa a casi blanca */
+  --color-highlight: rgba(59, 166, 241, 0.22);
+  --shadow-card: rgba(0, 0, 0, 0.4) 0px 4px 16px 0px;
+}
+
 html {
   background-color: var(--color-canvas);
 }
@@ -54,4 +71,17 @@ h3,
 .leaflet-container {
   font-family: var(--font-sans);
   border-radius: var(--radius-input);
+}
+
+/* Leaflet en modo oscuro: popups y zoom acordes a la superficie */
+.dark .leaflet-popup-content-wrapper,
+.dark .leaflet-popup-tip {
+  background: var(--color-surface);
+  color: var(--color-body);
+}
+
+.dark .leaflet-bar a {
+  background: var(--color-surface);
+  color: var(--color-body);
+  border-color: var(--color-hairline);
 }

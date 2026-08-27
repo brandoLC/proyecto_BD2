@@ -120,18 +120,53 @@ Convenciones del formato:
   CSV que la tabla no tiene se ignoran y se listan en
   `ignored_columns`; si falta una columna requerida, toda la carga falla.
 
+### Columna POINT derivada de latitud/longitud
+
+Muchos CSV reales traen las coordenadas en dos columnas float separadas
+en vez de un único punto `"(lat, lng)"`. MiniDB las detecta tras la
+inferencia y ofrece/crea una columna `POINT` derivada:
+
+- **Aliases** (por nombre saneado de columna, case-insensitive):
+  latitud = `latitude`, `lat`, `latitud`; longitud = `longitude`,
+  `lng`, `lon`, `long`, `longitud`. El orden de las columnas en el
+  archivo no importa; si hay varios pares se usa el primero plausible.
+- **Validación de rango**: ambas columnas deben ser `FLOAT`/`INT` y
+  todos sus valores del archivo completo deben caer en rango geográfico
+  (latitud ∈ [-90, 90], longitud ∈ [-180, 180]); si no, no se sugiere
+  nada (probablemente no son coordenadas).
+- El punto derivado es `(lat, lng)` — la convención del motor es
+  `(x, y)` con x = latitud, y = longitud — y la columna se llama
+  `location` (o `location_2`, ... si ya existe).
+- `CREATE TABLE t FROM FILE "f.csv"` la agrega automáticamente al
+  esquema y deriva los valores durante la carga; `LOAD INTO t FROM
+  FILE` la deriva si la tabla tiene exactamente una columna `POINT`
+  ausente del CSV y el CSV trae un par detectable. En `upload-csv` se
+  pide explícitamente con los campos de formulario `point_column`,
+  `lat_col` y `lng_col` (van juntos o no van); las filas con lat/lng no
+  numéricos se rechazan con motivo `location: lat/lng inválidos en
+  línea N`.
+
 ### Endpoints CSV
 
 - `POST /api/infer-schema` (multipart, campo `file`, opcional
   `table_name`) → infiere el esquema sin crear nada:
   `{"ok", "table_name", "columns": [{"name", "type", "primary_key"}],
   "suggested_sql", "preview_rows" (5 primeras filas crudas),
-  "total_rows_estimate"}`. En error: `{"ok": false, "error",
-  "stage": "parse"}`.
-- `POST /api/tables/{nombre}/upload-csv` (multipart, campo `file`) →
-  carga el CSV en una tabla existente:
+  "total_rows_estimate", "derived_point", "notes"}`. Si se detecta un
+  par lat/lng, `derived_point` es
+  `{"column": "location", "lat_col": "latitude", "lng_col": "longitude"}`
+  (`null` si no), `suggested_sql` termina con la columna derivada
+  (`..., location POINT);`) y `notes` lo explica (lista vacía si no).
+  En error: `{"ok": false, "error", "stage": "parse"}`.
+- `POST /api/tables/{nombre}/upload-csv` (multipart, campo `file`,
+  opcionales `point_column`, `lat_col`, `lng_col`) → carga el CSV en
+  una tabla existente:
   `{"ok", "rows_loaded", "rows_rejected", "errors": [{"line", "reason"}],
-  "ignored_columns", "elapsed_ms"}`.
+  "ignored_columns", "elapsed_ms"}`. Con los tres campos se deriva la
+  columna POINT `point_column` desde las columnas `lat_col`/`lng_col`
+  del CSV; un conjunto parcial, una `point_column` inexistente o no
+  POINT, o columnas lat/lng ausentes devuelven `{"ok": false, "stage":
+  "semantic"}`.
 
 Las filas se insertan por el mismo camino del motor que un `INSERT`
 normal, así que el heap file y todos los índices de la tabla quedan
@@ -207,6 +242,11 @@ curl -X POST localhost:8000/api/infer-schema -F "file=@restaurantes.csv"
 
 # Cargar un CSV en una tabla existente
 curl -X POST localhost:8000/api/tables/restaurantes/upload-csv -F "file=@restaurantes.csv"
+
+# Cargar un CSV con latitud/longitud derivando la columna POINT 'location'
+curl -X POST localhost:8000/api/tables/fastfood/upload-csv \
+  -F "file=@fast_food.csv" -F "point_column=location" \
+  -F "lat_col=latitude" -F "lng_col=longitude"
 
 # Crear y cargar directamente desde DATASETS_DIR
 curl -X POST localhost:8000/api/query -H 'Content-Type: application/json' \

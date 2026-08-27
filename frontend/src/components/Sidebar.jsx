@@ -25,6 +25,7 @@ export default function Sidebar({
   onSelectTable,
   csvUploads,
   onUploadCsv,
+  onDismissCsv,
   infer,
   onInfer,
   onClearInfer,
@@ -175,7 +176,10 @@ export default function Sidebar({
               )}
             </div>
 
-            <CsvUploadStatus status={csvUploads?.[t.name]} />
+            <CsvUploadStatus
+              status={csvUploads?.[t.name]}
+              onDismiss={onDismissCsv ? () => onDismissCsv(t.name) : undefined}
+            />
           </div>
         ))}
       </div>

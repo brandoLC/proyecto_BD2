@@ -38,9 +38,16 @@ export async function inferSchema(file, tableName) {
   return postForm('/api/infer-schema', form)
 }
 
-export async function uploadCsv(tableName, file) {
+// derivedPoint (opcional): {column, lat_col, lng_col} para que el backend
+// derive una columna POINT a partir de dos columnas del CSV.
+export async function uploadCsv(tableName, file, derivedPoint) {
   const form = new FormData()
   form.append('file', file)
+  if (derivedPoint) {
+    form.append('point_column', derivedPoint.column)
+    form.append('lat_col', derivedPoint.lat_col)
+    form.append('lng_col', derivedPoint.lng_col)
+  }
   return postForm(`/api/tables/${encodeURIComponent(tableName)}/upload-csv`, form)
 }
 

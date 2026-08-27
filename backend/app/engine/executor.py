@@ -34,7 +34,10 @@ from .csv_loader import (
     CSVError,
     MAX_ERRORS,
     cast_csv_value,
+    column_position,
     decode_csv_bytes,
+    derive_point_value,
+    detect_point_pair,
     infer_columns,
     map_columns,
     read_csv,
@@ -193,7 +196,7 @@ class Engine:
         t = time.perf_counter()
         self.catalog.drop_table(table)
         plan.add("Update Catalog", "catalog.json persistido", t)
-        return {"kind": "drop_table",
+        return {"kind": "drop_table", "table": table,
                 "message": f"Tabla '{table}' eliminada"}
 
     # ------------------------------------------------------------------
@@ -236,7 +239,7 @@ class Engine:
         self.catalog.create_table(table, columns)
         plan.add("Update Catalog", "catalog.json persistido", t)
         self._create_pk_index(table, columns, plan)
-        return {"kind": "create_table",
+        return {"kind": "create_table", "table": table,
                 "message": f"Tabla '{table}' creada"}
 
     def _create_pk_index(self, table: str, columns: list[Column],
@@ -287,11 +290,18 @@ class Engine:
 
         t = time.perf_counter()
         header, rows = self._read_dataset_csv(filename)
-        columns = infer_columns(header, [r for _, r in rows])
+        raw_rows = [r for _, r in rows]
+        columns = infer_columns(header, raw_rows)
         pk = next((c.name for c in columns if c.primary_key), None)
-        plan.add("Infer Schema",
-                 f"{len(columns)} columnas inferidas de '{filename}'"
-                 + (f", PK sugerida: {pk}" if pk else ""), t)
+        det = detect_point_pair(header, columns, raw_rows)
+        if det is not None:
+            columns.append(Column(det["column"], TYPE_POINT))
+        plan.add(
+            "Infer Schema",
+            f"{len(columns)} columnas inferidas de '{filename}'"
+            + (f", PK sugerida: {pk}" if pk else "")
+            + (f", {det['column']} POINT derivada de "
+               f"{det['lat_col']}+{det['lng_col']}" if det else ""), t)
 
         t = time.perf_counter()
         heap = self._open_heap(table, create=True)
@@ -304,11 +314,22 @@ class Engine:
         self._create_pk_index(table, columns, plan)
 
         t = time.perf_counter()
-        stats = self.bulk_load_rows(table, rows)
+        load_rows: list[tuple[int, list[str]]] = rows
+        derive: tuple[int, str] | None = None
+        if det is not None:
+            lat_i = column_position(header, det["lat_col"])
+            lng_i = column_position(header, det["lng_col"])
+            load_rows = [
+                (ln, list(raw) + [raw[lat_i] if lat_i < len(raw) else "",
+                                  raw[lng_i] if lng_i < len(raw) else ""])
+                for ln, raw in rows
+            ]
+            derive = (len(columns) - 1, det["column"])
+        stats = self.bulk_load_rows(table, load_rows, derive=derive)
         plan.add("Bulk Load",
                  f"{stats['rows_loaded']} filas cargadas, "
                  f"{stats['rows_rejected']} rechazadas desde '{filename}'", t)
-        return {"kind": "create_table",
+        return {"kind": "create_table", "table": table,
                 "message": f"Tabla '{table}' creada desde {filename}: "
                            f"{stats['rows_loaded']} filas cargadas, "
                            f"{stats['rows_rejected']} rechazadas",
@@ -322,18 +343,49 @@ class Engine:
 
         t = time.perf_counter()
         header, rows = self._read_dataset_csv(filename)
+        raw_rows = [r for _, r in rows]
+        # Derivación automática: la tabla tiene exactamente una columna
+        # POINT ausente del CSV y el CSV trae un par lat/lng detectable.
+        point_col: Column | None = None
+        det: dict | None = None
+        point_cols = [c for c in columns if c.type == TYPE_POINT]
+        header_names = {h.strip().lower() for h in header}
+        if (len(point_cols) == 1
+                and point_cols[0].name.lower() not in header_names):
+            det = detect_point_pair(
+                header, infer_columns(header, raw_rows), raw_rows)
+            if det is not None:
+                point_col = point_cols[0]
         try:
-            positions, ignored = map_columns(header, columns)
+            positions, ignored = map_columns(
+                header,
+                [c for c in columns if c is not point_col]
+                if point_col is not None else columns)
         except ValueError as exc:
             raise SemanticError(str(exc)) from exc
         plan.add("Map Columns",
                  f"{len(positions)} columnas mapeadas por nombre"
-                 + (f", ignoradas: {', '.join(ignored)}" if ignored else ""),
-                 t)
+                 + (f", ignoradas: {', '.join(ignored)}" if ignored else "")
+                 + (f", {point_col.name} derivada de "
+                    f"{det['lat_col']}+{det['lng_col']}"
+                    if point_col is not None else ""), t)
 
         t = time.perf_counter()
-        mapped = [(ln, reorder_row(raw, positions)) for ln, raw in rows]
-        stats = self.bulk_load_rows(table, mapped)
+        derive: tuple[int, str] | None = None
+        if point_col is not None:
+            lat_i = column_position(header, det["lat_col"])
+            lng_i = column_position(header, det["lng_col"])
+            mapped = [
+                (ln, reorder_row(raw, positions)
+                 + [raw[lat_i] if lat_i < len(raw) else "",
+                    raw[lng_i] if lng_i < len(raw) else ""])
+                for ln, raw in rows
+            ]
+            derive = ([c.name for c in columns].index(point_col.name),
+                      point_col.name)
+        else:
+            mapped = [(ln, reorder_row(raw, positions)) for ln, raw in rows]
+        stats = self.bulk_load_rows(table, mapped, derive=derive)
         plan.add("Bulk Load",
                  f"{stats['rows_loaded']} filas cargadas, "
                  f"{stats['rows_rejected']} rechazadas desde '{filename}'", t)
@@ -476,27 +528,46 @@ class Engine:
         return rid
 
     def bulk_load_rows(self, table: str,
-                       rows: list[tuple[int, list[str]]]) -> dict:
+                       rows: list[tuple[int, list[str]]],
+                       derive: tuple[int, str] | None = None) -> dict:
         """Carga masiva de filas crudas (strings) en una tabla existente.
 
         Cada elemento es ``(número de línea, valores crudos)`` ya
         ordenados según las columnas de la tabla. Las filas inválidas se
         rechazan sin abortar la carga; se conservan hasta ``MAX_ERRORS``
         errores con su número de línea.
+
+        Con ``derive = (posicion, nombre)`` la fila trae dos valores crudos
+        EXTRA al final (latitud y longitud): se construye el punto
+        ``(lat, lng)`` y se inserta en ``posicion`` antes del casteo; si
+        no son numéricos la fila se rechaza como ``lat/lng inválidos``.
         """
         columns = self._get_columns(table)
         loaded = rejected = 0
         errors: list[dict] = []
+        expected = len(columns) + (1 if derive else 0)
         for line_no, raw_row in rows:
-            if len(raw_row) != len(columns):
+            if len(raw_row) != expected:
                 rejected += 1
                 if len(errors) < MAX_ERRORS:
                     errors.append({
                         "line": line_no,
-                        "reason": f"se esperaban {len(columns)} valores, "
+                        "reason": f"se esperaban {expected} valores, "
                                   f"llegaron {len(raw_row)}",
                     })
                 continue
+            if derive is not None:
+                point_pos, point_name = derive
+                try:
+                    point = derive_point_value(raw_row[-2], raw_row[-1],
+                                               point_name, line_no)
+                except ValueError as exc:
+                    rejected += 1
+                    if len(errors) < MAX_ERRORS:
+                        errors.append({"line": line_no, "reason": str(exc)})
+                    continue
+                raw_row = list(raw_row[:-2])
+                raw_row.insert(point_pos, point)
             try:
                 row = [cast_csv_value(v, c)
                        for v, c in zip(raw_row, columns)]

@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 
 from app.engine.csv_loader import (
     cast_csv_value,
+    detect_point_pair,
+    derive_point_value,
     infer_columns,
     read_csv,
     sanitize_identifier,
@@ -126,6 +128,72 @@ class TestInferencia:
 
 
 # ----------------------------------------------------------------------
+# Detección de pares latitud/longitud (lógica directa)
+# ----------------------------------------------------------------------
+class TestDetectPointPair:
+    def _detect(self, header, rows):
+        cols = infer_columns(header, rows)
+        return detect_point_pair(header, cols, rows)
+
+    def test_aliases_latitude_longitude(self):
+        det = self._detect(
+            ["name", "latitude", "longitude"],
+            [["A", "44.9", "-74.9"], ["B", "40.7", "-73.9"]])
+        assert det == {"column": "location",
+                       "lat_col": "latitude", "lng_col": "longitude"}
+
+    def test_aliases_lat_lng(self):
+        det = self._detect(["lat", "lng", "name"],
+                           [["-12.04", "-77.04", "A"]])
+        assert det["lat_col"] == "lat" and det["lng_col"] == "lng"
+
+    def test_aliases_latitud_longitud(self):
+        det = self._detect(
+            ["latitud", "longitud"],
+            [["-12.04", "-77.04"], ["-12.10", "-77.05"]])
+        assert det is not None
+        assert det["lat_col"] == "latitud" and det["lng_col"] == "longitud"
+
+    def test_orden_invertido(self):
+        # longitude antes que latitude: el orden no importa
+        det = self._detect(["longitude", "latitude"], [["-74.9", "44.9"]])
+        assert det["lat_col"] == "latitude" and det["lng_col"] == "longitude"
+
+    def test_lon_y_int(self):
+        # INT también vale si los valores están en rango
+        det = self._detect(["lat", "lon"], [["44", "-74"], ["45", "-75"]])
+        assert det is not None and det["lng_col"] == "lon"
+
+    def test_fuera_de_rango_no_sugiere(self):
+        # latitudes > 90: probablemente no son coordenadas
+        det = self._detect(["lat", "lng"], [["150.5", "-74.9"]])
+        assert det is None
+        # longitud > 180
+        det = self._detect(["latitude", "longitude"], [["44.9", "-190.0"]])
+        assert det is None
+
+    def test_no_float_no_sugiere(self):
+        det = self._detect(["lat", "lng"], [["norte", "oeste"]])
+        assert det is None
+
+    def test_sin_par_no_sugiere(self):
+        det = self._detect(["lat", "precio"], [["44.9", "10.5"]])
+        assert det is None
+
+    def test_location_existente_dedup(self):
+        det = self._detect(
+            ["location", "latitude", "longitude"],
+            [["(1, 1)", "44.9", "-74.9"]])
+        assert det["column"] == "location_2"
+
+    def test_derive_point_value(self):
+        assert derive_point_value(" 44.92 ", "-74.89", "location", 7) == \
+            "(44.92, -74.89)"
+        with pytest.raises(ValueError, match="lat/lng inválidos en línea 7"):
+            derive_point_value("n/a", "-74.89", "location", 7)
+
+
+# ----------------------------------------------------------------------
 # Lectura y casteo (lógica directa)
 # ----------------------------------------------------------------------
 class TestLecturaYCasteo:
@@ -203,6 +271,34 @@ class TestInferSchemaEndpoint:
         client, _ = api
         r = post_csv(client, "/api/infer-schema", "  \n")
         assert r["ok"] is False and r["stage"] == "parse"
+
+    def test_infer_schema_sin_par_latlng(self, api):
+        client, _ = api
+        r = post_csv(client, "/api/infer-schema", self.CSV,
+                     filename="restaurantes.csv")
+        assert r["ok"] is True
+        assert r["derived_point"] is None
+        assert r["notes"] == []
+        assert not r["suggested_sql"].endswith("location POINT);")
+
+    def test_infer_schema_con_par_latlng(self, api):
+        client, _ = api
+        csv_text = (
+            "name,latitude,longitude,websites\n"
+            "McDonald's,44.9281,-74.8919,https://mcdonalds.com\n"
+            "Burger King,40.7128,-73.9352,https://bk.com\n"
+        )
+        r = post_csv(client, "/api/infer-schema", csv_text,
+                     filename="fastfood.csv")
+        assert r["ok"] is True
+        assert r["derived_point"] == {"column": "location",
+                                      "lat_col": "latitude",
+                                      "lng_col": "longitude"}
+        assert r["suggested_sql"].endswith(", location POINT);")
+        # las columnas inferidas no incluyen la derivada
+        assert "location" not in {c["name"] for c in r["columns"]}
+        assert r["notes"] == ["columna 'location' (POINT) derivada de "
+                              "'latitude' + 'longitude'"]
 
 
 # ----------------------------------------------------------------------
@@ -304,6 +400,85 @@ class TestUploadCSV:
         assert len(sel["rows"]) == 11  # precios 100.5 .. 200.5
 
 
+class TestUploadCSVDerivedPoint:
+    CSV = (
+        "id,name,latitude,longitude\n"
+        "1,McDonald's,44.9281,-74.8919\n"
+        "2,Burger King,40.7128,-73.9352\n"
+    )
+
+    def _crear_tabla(self, engine):
+        r = engine.execute(
+            "CREATE TABLE ff (id INT PRIMARY KEY, name VARCHAR(30), "
+            "latitude FLOAT, longitude FLOAT, location POINT);")
+        assert r["ok"]
+
+    def test_upload_con_punto_derivado(self, api):
+        client, engine = api
+        self._crear_tabla(engine)
+        r = post_csv(client, "/api/tables/ff/upload-csv", self.CSV,
+                     data={"point_column": "location",
+                           "lat_col": "latitude", "lng_col": "longitude"})
+        assert r["ok"] is True
+        assert r["rows_loaded"] == 2 and r["rows_rejected"] == 0
+        sel = engine.execute("SELECT id, location FROM ff WHERE id = 1;")
+        assert sel["rows"] == [[1, [44.9281, -74.8919]]]
+        # consulta espacial sobre la columna derivada
+        sel = engine.execute(
+            "SELECT id FROM ff WHERE location KNN ((44.92, -74.89), 1);")
+        assert sel["rows"] == [[1]]
+
+    def test_lat_invalida_rechaza_fila(self, api):
+        client, engine = api
+        self._crear_tabla(engine)
+        csv_text = self.CSV + "3,Roto,nope,-73.0\n"
+        r = post_csv(client, "/api/tables/ff/upload-csv", csv_text,
+                     data={"point_column": "location",
+                           "lat_col": "latitude", "lng_col": "longitude"})
+        assert r["ok"] is True
+        assert r["rows_loaded"] == 2 and r["rows_rejected"] == 1
+        assert r["errors"][0]["line"] == 4
+        assert "location: lat/lng inválidos en línea 4" in \
+            r["errors"][0]["reason"]
+
+    def test_campos_parciales_error_semantico(self, api):
+        client, engine = api
+        self._crear_tabla(engine)
+        for data in ({"point_column": "location"},
+                     {"point_column": "location", "lat_col": "latitude"}):
+            r = post_csv(client, "/api/tables/ff/upload-csv", self.CSV,
+                         data=data)
+            assert r["ok"] is False and r["stage"] == "semantic"
+            assert "juntos" in r["error"]
+
+    def test_point_column_inexistente(self, api):
+        client, engine = api
+        self._crear_tabla(engine)
+        r = post_csv(client, "/api/tables/ff/upload-csv", self.CSV,
+                     data={"point_column": "ubicacion",
+                           "lat_col": "latitude", "lng_col": "longitude"})
+        assert r["ok"] is False and r["stage"] == "semantic"
+        assert "ubicacion" in r["error"]
+
+    def test_point_column_no_es_point(self, api):
+        client, engine = api
+        self._crear_tabla(engine)
+        r = post_csv(client, "/api/tables/ff/upload-csv", self.CSV,
+                     data={"point_column": "name",
+                           "lat_col": "latitude", "lng_col": "longitude"})
+        assert r["ok"] is False and r["stage"] == "semantic"
+        assert "no es POINT" in r["error"]
+
+    def test_lat_col_ausente_del_csv(self, api):
+        client, engine = api
+        self._crear_tabla(engine)
+        r = post_csv(client, "/api/tables/ff/upload-csv", self.CSV,
+                     data={"point_column": "location",
+                           "lat_col": "lat", "lng_col": "longitude"})
+        assert r["ok"] is False and r["stage"] == "semantic"
+        assert "'lat'" in r["error"]
+
+
 # ----------------------------------------------------------------------
 # FROM FILE (parser + executor)
 # ----------------------------------------------------------------------
@@ -396,3 +571,68 @@ class TestFromFile:
             "SELECT id FROM rest WHERE ubicacion "
             "IN ((-12.05, -77.03), 0.02);")
         assert {row[0] for row in sel["rows"]} == {1, 2}
+
+
+FF_CSV = (
+    "name,latitude,longitude\n"
+    "McDonald's Massena,44.9281,-74.8919\n"
+    "Burger King NYC,40.7128,-73.9352\n"
+    "McDonald's LA,34.0522,-118.2437\n"
+)
+
+
+class TestFromFileDerivedPoint:
+    def test_create_from_file_deriva_point(self, engine_ds):
+        engine, ds = engine_ds
+        (ds / "ff.csv").write_text(FF_CSV, encoding="utf-8")
+        r = engine.execute('CREATE TABLE ff FROM FILE "ff.csv";')
+        assert r["ok"]
+        cols = {c.name: c.type for c in engine.catalog.columns("ff")}
+        assert cols["location"] == "POINT"
+        assert "3 filas cargadas" in r["message"]
+        detalle = next(s["detail"] for s in r["plan"]
+                       if s["name"] == "Infer Schema")
+        assert "location POINT derivada de latitude+longitude" in detalle
+        sel = engine.execute("SELECT name, location FROM ff;")
+        assert sel["rowcount"] == 3
+        assert [44.9281, -74.8919] in [row[1] for row in sel["rows"]]
+
+    def test_create_from_file_point_knn_rtree(self, engine_ds):
+        engine, ds = engine_ds
+        (ds / "ff.csv").write_text(FF_CSV, encoding="utf-8")
+        engine.execute('CREATE TABLE ff FROM FILE "ff.csv";')
+        r = engine.execute("CREATE INDEX ON ff (location) USING RTREE;")
+        assert r["ok"]
+        sel = engine.execute(
+            "SELECT name FROM ff WHERE location "
+            "KNN ((44.92, -74.89), 1);")
+        assert sel["ok"] and sel["rows"] == [["McDonald's Massena"]]
+        assert "R-Tree KNN Search" in [s["name"] for s in sel["plan"]]
+
+    def test_load_into_deriva_point_automatico(self, engine_ds):
+        engine, ds = engine_ds
+        (ds / "ff.csv").write_text(
+            "id,name,latitude,longitude\n"
+            "1,McDonald's Massena,44.9281,-74.8919\n"
+            "2,Burger King NYC,40.7128,-73.9352\n", encoding="utf-8")
+        engine.execute(
+            "CREATE TABLE ff (id INT PRIMARY KEY, name VARCHAR(30), "
+            "location POINT);")
+        r = engine.execute('LOAD INTO ff FROM FILE "ff.csv";')
+        assert r["ok"] and r["rowcount"] == 2
+        detalle = next(s["detail"] for s in r["plan"]
+                       if s["name"] == "Map Columns")
+        assert "location derivada de latitude+longitude" in detalle
+        sel = engine.execute("SELECT id, location FROM ff WHERE id = 1;")
+        assert sel["rows"] == [[1, [44.9281, -74.8919]]]
+
+    def test_load_into_sin_par_comportamiento_actual(self, engine_ds):
+        # la tabla tiene POINT pero el CSV no trae par lat/lng -> error
+        engine, ds = engine_ds
+        (ds / "x.csv").write_text("id,name\n1,Solo\n", encoding="utf-8")
+        engine.execute(
+            "CREATE TABLE ff (id INT PRIMARY KEY, name VARCHAR(30), "
+            "location POINT);")
+        r = engine.execute('LOAD INTO ff FROM FILE "x.csv";')
+        assert not r["ok"] and r["stage"] == "semantic"
+        assert "location" in r["error"]

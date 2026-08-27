@@ -4,8 +4,19 @@ function formatInt(n) {
   return typeof n === 'number' ? n.toLocaleString('es-PE') : '—'
 }
 
-export default function CsvUploadStatus({ status }) {
+export default function CsvUploadStatus({ status, onDismiss }) {
   if (!status) return null
+
+  const dismissBtn = onDismiss && (
+    <button
+      type="button"
+      onClick={onDismiss}
+      title="Cerrar"
+      className="shrink-0 rounded-full px-1.5 text-helper transition-colors hover:text-ink"
+    >
+      ✕
+    </button>
+  )
 
   if (status.error) {
     return (
@@ -17,6 +28,7 @@ export default function CsvUploadStatus({ status }) {
             </span>
           )}
           <p className="font-mono text-[11px] leading-relaxed text-error">{status.error.error}</p>
+          {dismissBtn}
         </div>
       </div>
     )
@@ -29,9 +41,12 @@ export default function CsvUploadStatus({ status }) {
 
   return (
     <div className="mt-2 rounded-input border border-success/40 bg-success/5 px-3 py-2">
-      <p className="text-xs text-success">
-        {formatInt(r.rows_loaded)} filas cargadas en {Math.round(r.elapsed_ms ?? 0)} ms
-      </p>
+      <div className="flex items-start gap-2">
+        <p className="text-xs text-success">
+          {formatInt(r.rows_loaded)} filas cargadas en {Math.round(r.elapsed_ms ?? 0)} ms
+        </p>
+        {dismissBtn}
+      </div>
 
       {rejected && (
         <details className="mt-1.5">

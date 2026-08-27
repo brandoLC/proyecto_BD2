@@ -54,6 +54,16 @@ services:
       - backend
 ```
 
+## Modo oscuro
+
+El botón sol/luna de la barra superior alterna entre modo claro y oscuro.
+La elección se guarda en `localStorage` (`theme: "dark" | "light"`); en la
+primera visita se sigue `prefers-color-scheme`. Un script inline en
+`index.html` aplica la clase `dark` en `<html>` antes del primer paint para
+evitar destellos. Los tokens de color (`@theme` en `src/index.css`) se
+redefinen bajo el selector `.dark`, y los tiles del mapa cambian de
+OpenStreetMap a CartoDB Dark Matter.
+
 ## Flujo CSV
 
 Hay dos formas de trabajar con archivos CSV (ambas usan `multipart/form-data`):

@@ -1,8 +1,23 @@
 // Pestaña Mapa: puntos espaciales sobre OpenStreetMap (Lima por defecto).
-import { MapContainer, TileLayer, CircleMarker, Circle, Popup } from 'react-leaflet'
+import { useEffect } from 'react'
+import L from 'leaflet'
+import { MapContainer, TileLayer, CircleMarker, Circle, Popup, useMap } from 'react-leaflet'
 
 const LIMA = [-12.0464, -77.0428]
 const ACCENT = '#3ba6f1'
+
+// Tiles según el tema: OSM estándar en claro, CartoDB dark en oscuro.
+const TILES = {
+  light: {
+    url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  },
+  dark: {
+    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    attribution:
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  },
+}
 
 // Detecta "WHERE <col> IN ((x, y), r)" para dibujar el círculo de búsqueda.
 function parseRadius(sql) {
@@ -14,7 +29,33 @@ function parseRadius(sql) {
   return { center: [Number(m[1]), Number(m[2])], radius: Number(m[3]) }
 }
 
-export default function MapPanel({ result, sql }) {
+// Encuadra el mapa en los puntos (y el círculo de búsqueda, si existe) cada
+// vez que cambia el conjunto de resultados, en lugar de quedarse en Lima.
+function FitBounds({ points, radiusCircle }) {
+  const map = useMap()
+  const first = points[0]
+  // Firma simple del resultado: cantidad + primer punto (+ círculo).
+  const signature = `${points.length}:${first ? `${first.x},${first.y}` : ''}${
+    radiusCircle ? `|${radiusCircle.center}|${radiusCircle.radius}` : ''
+  }`
+
+  useEffect(() => {
+    const bounds = L.latLngBounds(points.map((p) => [p.x, p.y]))
+    if (radiusCircle) {
+      // El radio viene en grados; se expande el encuadre para incluir el círculo.
+      const [cx, cy] = radiusCircle.center
+      const r = radiusCircle.radius
+      bounds.extend([cx - r, cy - r])
+      bounds.extend([cx + r, cy + r])
+    }
+    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, signature])
+
+  return null
+}
+
+export default function MapPanel({ result, sql, theme = 'light' }) {
   const spatial = result?.spatial
 
   if (!spatial || !spatial.points || spatial.points.length === 0) {
@@ -30,9 +71,12 @@ export default function MapPanel({ result, sql }) {
   return (
     <div className="overflow-hidden rounded-input border border-hairline">
       <MapContainer center={LIMA} zoom={13} style={{ height: '420px', width: '100%' }}>
+        <FitBounds points={spatial.points} radiusCircle={radius} />
         <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          // key por tema: fuerza el remontaje de la capa al cambiar claro/oscuro.
+          key={theme}
+          attribution={TILES[theme].attribution}
+          url={TILES[theme].url}
         />
         {radius && (
           <Circle

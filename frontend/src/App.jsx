@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getHealth, getTables, inferSchema, postQuery, uploadCsv } from './api.js'
+import useTheme from './hooks/useTheme.js'
 import TopNav from './components/TopNav.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import SqlEditor from './components/SqlEditor.jsx'
@@ -11,6 +12,7 @@ import MapPanel from './components/MapPanel.jsx'
 const TABS = ['Resultados', 'Plan', 'Mapa']
 
 export default function App() {
+  const [theme, toggleTheme] = useTheme()
   const [health, setHealth] = useState('checking')
   const [tables, setTables] = useState([])
   const [tablesLoading, setTablesLoading] = useState(false)
@@ -26,6 +28,8 @@ export default function App() {
   // CSV: resultado/estado de carga por tabla, y estado del asistente "Nuevo desde CSV".
   const [csvUploads, setCsvUploads] = useState({}) // { [tabla]: {loading?, result?, error?} }
   const [infer, setInfer] = useState(null) // null | {loading} | {data} | {error:{error,stage}}
+  // Columna POINT derivada por tabla inferida: { [tabla]: {column, lat_col, lng_col} }
+  const [derivedPoints, setDerivedPoints] = useState({})
 
   const checkHealth = useCallback(async () => {
     try {
@@ -68,8 +72,26 @@ export default function App() {
         setResult(data)
         setLastSql(query)
         // Refrescar metadatos si el esquema pudo cambiar.
-        if (data.kind === 'create_table' || data.kind === 'create_index' || data.kind === 'insert' || data.kind === 'delete') {
+        if (['create_table', 'create_index', 'insert', 'delete', 'drop_table'].includes(data.kind)) {
           loadTables()
+        }
+        // Una tabla recreada/eliminada invalida el mensaje de carga CSV anterior.
+        if ((data.kind === 'create_table' || data.kind === 'drop_table') && data.table) {
+          setCsvUploads((prev) => {
+            const next = { ...prev }
+            delete next[data.table]
+            return next
+          })
+        }
+        // El mapeo de POINT derivado solo se invalida al ELIMINAR la tabla;
+        // al crearla se necesita intacto para el "Cargar CSV" que sigue.
+        if (data.kind === 'drop_table' && data.table) {
+          setDerivedPoints((prev) => {
+            if (!(data.table in prev)) return prev
+            const next = { ...prev }
+            delete next[data.table]
+            return next
+          })
         }
       } else {
         setQueryError({ error: data.error || 'Error desconocido', stage: data.stage })
@@ -101,9 +123,16 @@ export default function App() {
       if (!file) return
       setCsvUploads((prev) => ({ ...prev, [name]: { loading: true } }))
       try {
-        const data = await uploadCsv(name, file)
+        // Si el esquema se infirió con columna POINT derivada, enviar el mapeo.
+        const data = await uploadCsv(name, file, derivedPoints[name])
         if (data.ok) {
           setCsvUploads((prev) => ({ ...prev, [name]: { result: data } }))
+          setDerivedPoints((prev) => {
+            if (!(name in prev)) return prev
+            const next = { ...prev }
+            delete next[name]
+            return next
+          })
           loadTables() // cambia el rowcount
         } else {
           setCsvUploads((prev) => ({
@@ -118,7 +147,7 @@ export default function App() {
         }))
       }
     },
-    [loadTables],
+    [loadTables, derivedPoints],
   )
 
   const inferFromCsv = useCallback(async (file) => {
@@ -130,6 +159,10 @@ export default function App() {
         setInfer({ data })
         setSql(data.suggested_sql) // cargar el CREATE TABLE sugerido en el editor
         setQueryError(null)
+        // Recordar la columna POINT derivada para la carga CSV posterior.
+        if (data.derived_point) {
+          setDerivedPoints((prev) => ({ ...prev, [data.table_name]: data.derived_point }))
+        }
       } else {
         setInfer({ error: { error: data.error || 'Error desconocido', stage: data.stage } })
       }
@@ -138,9 +171,17 @@ export default function App() {
     }
   }, [])
 
+  const dismissCsv = useCallback((name) => {
+    setCsvUploads((prev) => {
+      const next = { ...prev }
+      delete next[name]
+      return next
+    })
+  }, [])
+
   return (
     <div className="min-h-screen bg-canvas">
-      <TopNav health={health} />
+      <TopNav health={health} theme={theme} onToggleTheme={toggleTheme} />
 
       <main className="mx-auto max-w-[1200px] px-4 py-6 sm:px-6">
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-[300px_1fr]">
@@ -152,6 +193,7 @@ export default function App() {
             onSelectTable={selectTable}
             csvUploads={csvUploads}
             onUploadCsv={uploadCsvToTable}
+            onDismissCsv={dismissCsv}
             infer={infer}
             onInfer={inferFromCsv}
             onClearInfer={() => setInfer(null)}
@@ -179,7 +221,7 @@ export default function App() {
                     onClick={() => setTab(t)}
                     className={
                       t === tab
-                        ? 'rounded-full bg-dark px-4 py-1.5 text-sm text-white'
+                        ? 'rounded-full bg-dark px-4 py-1.5 text-sm text-white dark:text-canvas'
                         : 'rounded-full border border-hairline px-4 py-1.5 text-sm text-ink transition-colors hover:bg-canvas'
                     }
                   >
@@ -190,7 +232,7 @@ export default function App() {
 
               {tab === 'Resultados' && <ResultsTable result={result} />}
               {tab === 'Plan' && <PlanPanel result={result} />}
-              {tab === 'Mapa' && <MapPanel result={result} sql={lastSql} />}
+              {tab === 'Mapa' && <MapPanel result={result} sql={lastSql} theme={theme} />}
             </section>
           </div>
         </div>

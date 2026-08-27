@@ -100,6 +100,22 @@ export default function InferSchemaPanel({ infer, onClose }) {
             ≈ {formatInt(infer.data.total_rows_estimate)} filas estimadas
           </p>
 
+          {(infer.data.derived_point || (infer.data.notes || []).length > 0) && (
+            <div className="flex flex-col gap-1 rounded-input border border-accent/40 bg-highlight/30 px-3 py-2">
+              {infer.data.derived_point && (
+                <span className="w-fit rounded-full border border-accent px-2 py-0.5 font-mono text-[10px] text-accent-edge">
+                  📍 {infer.data.derived_point.column}: POINT derivada de{' '}
+                  {infer.data.derived_point.lat_col} + {infer.data.derived_point.lng_col}
+                </span>
+              )}
+              {(infer.data.notes || []).map((note, i) => (
+                <p key={i} className="text-[11px] text-helper">
+                  {note}
+                </p>
+              ))}
+            </div>
+          )}
+
           <p className="rounded-input border border-accent/40 bg-highlight/30 px-3 py-2 text-[11px] text-body">
             Revisa y ejecuta el CREATE TABLE sugerido, luego usa 'Cargar CSV' en la tabla
             creada.

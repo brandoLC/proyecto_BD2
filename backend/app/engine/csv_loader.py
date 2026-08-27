@@ -20,6 +20,11 @@ El tamaño de ``VARCHAR(n)`` usa la longitud máxima de todo el archivo
 con un 20 % de holgura redondeado a múltiplos de 10 (mínimo 20), o
 ``TEXT`` si supera 255. Se sugiere PRIMARY KEY cuando la primera columna
 es ``INT`` con valores únicos.
+
+Además se detectan pares de columnas latitud/longitud (aliases
+``latitude/lat/latitud`` y ``longitude/lng/lon/long/longitud``, con
+valores en rango geográfico) para derivar una columna ``POINT``
+``(lat, lng)`` aprovechable por los índices R-Tree.
 """
 
 from __future__ import annotations
@@ -193,6 +198,93 @@ def suggested_create_sql(table: str, columns: list[Column]) -> str:
         for c in columns
     )
     return f"CREATE TABLE {table} ({defs});"
+
+
+# ----------------------------------------------------------------------
+# Detección de pares latitud/longitud -> columna POINT derivada
+# ----------------------------------------------------------------------
+LAT_ALIASES = ("latitude", "lat", "latitud")
+LNG_ALIASES = ("longitude", "lng", "lon", "long", "longitud")
+
+
+def _dedup_name(base: str, used: set[str]) -> str:
+    """``base`` o ``base_2``, ``base_3``, ... según lo ya usado."""
+    name = base
+    k = 2
+    while name in used:
+        name = f"{base}_{k}"
+        k += 1
+    return name
+
+
+def _in_geo_range(rows: list[list[str]], j: int,
+                  lo: float, hi: float) -> bool:
+    """Todos los valores no vacíos de la columna ``j`` caen en [lo, hi]."""
+    vals = [r[j].strip() for r in rows if r[j].strip() != ""]
+    if not vals:
+        return False
+    try:
+        return all(lo <= float(v) <= hi for v in vals)
+    except ValueError:
+        return False
+
+
+def detect_point_pair(header: list[str], columns: list[Column],
+                      rows: list[list[str]]) -> dict | None:
+    """Detecta un par de columnas lat/lng derivable a una columna POINT.
+
+    Busca por nombre saneado (los alias son case-insensitive por
+    construcción) sin importar el orden de las columnas; ambas deben ser
+    FLOAT/INT y sus valores de TODO el archivo deben caer en rango
+    geográfico (latitud en [-90, 90], longitud en [-180, 180]) para
+    descartar falsos positivos. Si hay varios pares plausibles se usa el
+    primero. Devuelve ``{"column", "lat_col", "lng_col"}`` o ``None``; el
+    nombre de la columna derivada es ``location`` (o ``location_2``... si
+    ya existe).
+    """
+    full = [r for r in rows if len(r) == len(header)]
+    lats = [j for j, c in enumerate(columns)
+            if c.name in LAT_ALIASES and c.type in (TYPE_FLOAT, TYPE_INT)]
+    lngs = [j for j, c in enumerate(columns)
+            if c.name in LNG_ALIASES and c.type in (TYPE_FLOAT, TYPE_INT)]
+    for j in lats:
+        for k in lngs:
+            if j == k:
+                continue
+            if (_in_geo_range(full, j, -90.0, 90.0)
+                    and _in_geo_range(full, k, -180.0, 180.0)):
+                return {
+                    "column": _dedup_name("location",
+                                          {c.name for c in columns}),
+                    "lat_col": columns[j].name,
+                    "lng_col": columns[k].name,
+                }
+    return None
+
+
+def column_position(header: list[str], name: str) -> int | None:
+    """Posición de ``name`` en la cabecera (strip + case-insensitive)."""
+    target = name.strip().lower()
+    for i, h in enumerate(header):
+        if h.strip().lower() == target:
+            return i
+    return None
+
+
+def derive_point_value(lat_raw: str, lng_raw: str,
+                       col_name: str, line_no: int) -> str:
+    """Construye el valor crudo ``"(lat, lng)"`` de la columna derivada.
+
+    Convención del motor: un punto es ``(x, y)`` con x = latitud e
+    y = longitud. Lanza ``ValueError`` si algún valor no es numérico.
+    """
+    try:
+        lat = float(lat_raw.strip())
+        lng = float(lng_raw.strip())
+    except (ValueError, AttributeError):
+        raise ValueError(
+            f"{col_name}: lat/lng inválidos en línea {line_no}") from None
+    return f"({lat}, {lng})"
 
 
 # ----------------------------------------------------------------------
