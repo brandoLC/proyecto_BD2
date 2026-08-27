@@ -64,6 +64,13 @@ evitar destellos. Los tokens de color (`@theme` en `src/index.css`) se
 redefinen bajo el selector `.dark`, y los tiles del mapa cambian de
 OpenStreetMap a CartoDB Dark Matter.
 
+Los tiles oscuros usan CARTO Basemaps (raster), que pide API key.
+Se configura en el `.env` de la raíz del proyecto (ver `.env.example`):
+`CARTO_API_KEY=...`. docker-compose la pasa como build arg
+(`VITE_CARTO_API_KEY`) y Vite la incrusta en el bundle; sin key los
+tiles funcionan pero con marca de agua. Mantener visible la
+atribución de CARTO/OSM (condición del tier gratuito).
+
 ## Flujo CSV
 
 Hay dos formas de trabajar con archivos CSV (ambas usan `multipart/form-data`):

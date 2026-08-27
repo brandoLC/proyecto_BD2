@@ -6,6 +6,14 @@ import { MapContainer, TileLayer, CircleMarker, Circle, Popup, useMap } from 're
 const LIMA = [-12.0464, -77.0428]
 const ACCENT = '#3ba6f1'
 
+// API key de CARTO Basemaps (raster): se inyecta en build con
+// VITE_CARTO_API_KEY (ver .env en la raíz y el build arg del Dockerfile).
+// Sin key los tiles oscuros funcionan pero muestran marca de agua.
+const CARTO_KEY = import.meta.env.VITE_CARTO_API_KEY || ''
+const cartoUrl = (style) =>
+  `https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png` +
+  (CARTO_KEY ? `?key=${CARTO_KEY}` : '')
+
 // Tiles según el tema: OSM estándar en claro, CartoDB dark en oscuro.
 const TILES = {
   light: {
@@ -13,7 +21,7 @@ const TILES = {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
   },
   dark: {
-    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    url: cartoUrl('dark_all'),
     attribution:
       '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
   },

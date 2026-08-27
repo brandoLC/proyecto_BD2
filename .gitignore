@@ -17,3 +17,6 @@ data/
 # Docker / SO
 *.log
 .DS_Store
+
+# Secretos locales
+.env

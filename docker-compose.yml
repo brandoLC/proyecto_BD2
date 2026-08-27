@@ -13,7 +13,11 @@ services:
       - "8000:8000"
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        # Se toma del .env de la raíz (gitignoreado); vacío = sin key
+        VITE_CARTO_API_KEY: ${CARTO_API_KEY:-}
     image: minidb-frontend
     container_name: minidb-frontend
     ports:

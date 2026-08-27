@@ -1,6 +1,11 @@
 # Etapa 1: build de la SPA con Node
 FROM node:20-alpine AS build
 WORKDIR /app
+
+# Key de CARTO Basemaps para los tiles oscuros (opcional; sin ella hay marca de agua)
+ARG VITE_CARTO_API_KEY=""
+ENV VITE_CARTO_API_KEY=$VITE_CARTO_API_KEY
+
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
