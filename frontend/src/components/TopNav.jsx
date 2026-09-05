@@ -1,5 +1,13 @@
-// Barra superior: marca MiniDB + estado de conexión con el backend.
-export default function TopNav({ health, theme, onToggleTheme }) {
+// Barra superior: toggle del sidebar, marca MiniDB + breadcrumb de la
+// tabla activa + estado de conexión con el backend.
+export default function TopNav({
+  health,
+  theme,
+  onToggleTheme,
+  activeTable,
+  sidebarOpen,
+  onToggleSidebar,
+}) {
   // health: 'checking' | 'ok' | 'down'
   const dot =
     health === 'ok'
@@ -17,6 +25,44 @@ export default function TopNav({ health, theme, onToggleTheme }) {
   return (
     <header className="flex items-center justify-between border-b border-hairline bg-surface px-6 py-3">
       <div className="flex items-center gap-2.5">
+        <button
+          type="button"
+          onClick={onToggleSidebar}
+          title={sidebarOpen ? 'Ocultar panel de archivos' : 'Mostrar panel de archivos'}
+          aria-label={sidebarOpen ? 'Ocultar panel de archivos' : 'Mostrar panel de archivos'}
+          className="rounded-full border border-hairline p-1.5 text-body transition-colors hover:bg-canvas hover:text-ink"
+        >
+          {sidebarOpen ? (
+            // « : visible con el sidebar abierto
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M15 6l-6 6 6 6" />
+            </svg>
+          ) : (
+            // hamburguesa: visible con el sidebar colapsado
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              aria-hidden="true"
+            >
+              <path d="M4 7h16M4 12h16M4 17h16" />
+            </svg>
+          )}
+        </button>
         {/* glifo spark */}
         <svg
           width="18"
@@ -33,6 +79,15 @@ export default function TopNav({ health, theme, onToggleTheme }) {
         </svg>
         <span className="font-heading text-[17px] font-medium tracking-tight text-ink">
           MiniDB
+        </span>
+        <span className="font-mono text-xs text-body">
+          minidb
+          {activeTable && (
+            <>
+              <span className="mx-1 text-helper">›</span>
+              <span className="text-accent-edge">{activeTable}</span>
+            </>
+          )}
         </span>
         <span className="hidden text-xs text-helper sm:inline">
           CS2042 · Bases de Datos II

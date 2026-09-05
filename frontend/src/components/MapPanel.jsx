@@ -13,15 +13,20 @@ const CARTO_KEY = import.meta.env.VITE_CARTO_API_KEY || ''
 const cartoUrl = (style) =>
   `https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png` +
   (CARTO_KEY ? `?key=${CARTO_KEY}` : '')
+// Voyager solo existe en el servicio raster con key: /rastertiles/voyager/
+// (sin subdominio {s}); en el path /voyager/ da 404.
+const VOYAGER_URL =
+  `https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png` +
+  (CARTO_KEY ? `?key=${CARTO_KEY}` : '')
 
-// Tiles según el tema: CARTO Positron (grises, estilo editorial) en claro,
-// CartoDB Dark Matter en oscuro. Con key de CARTO van sin marca de agua;
-// sin key, el modo claro cae a OSM (gratis, sin watermark) y el oscuro
-// queda con watermark.
+// Tiles según el tema: CARTO Voyager (a color) en claro, CartoDB Dark
+// Matter en oscuro. Con key de CARTO van sin marca de agua; sin key, el
+// modo claro cae a OSM (gratis, sin watermark) y el oscuro queda con
+// watermark.
 const TILES = {
   light: {
     url: CARTO_KEY
-      ? cartoUrl('light_all')
+      ? VOYAGER_URL
       : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     attribution: CARTO_KEY
       ? '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'

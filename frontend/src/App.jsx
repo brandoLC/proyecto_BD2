@@ -10,6 +10,34 @@ import PlanPanel from './components/PlanPanel.jsx'
 import MapPanel from './components/MapPanel.jsx'
 
 const TABS = ['Resultados', 'Plan', 'Mapa']
+const HISTORY_KEY = 'minidb:history'
+const HISTORY_MAX = 20
+const SIDEBAR_KEY = 'minidb:sidebar'
+
+// Extrae la tabla afectada por una sentencia del subconjunto MiniDB.
+function extractTableName(query) {
+  const m = query.match(
+    /^\s*create\s+index\s+\w+\s+on\s+(\w+)|^\s*(?:select\b[\s\S]*?\bfrom|insert\s+into|create\s+table|drop\s+table|load\s+into)\s+(\w+)/i,
+  )
+  return m ? m[1] || m[2] : null
+}
+
+function loadHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(HISTORY_KEY))
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function loadSidebarOpen() {
+  try {
+    return localStorage.getItem(SIDEBAR_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
 
 export default function App() {
   const [theme, toggleTheme] = useTheme()
@@ -23,7 +51,18 @@ export default function App() {
   const [result, setResult] = useState(null) // última respuesta ok:true
   const [queryError, setQueryError] = useState(null) // {error, stage} de ok:false
   const [lastSql, setLastSql] = useState('') // SQL que produjo `result`
+  const [lastTable, setLastTable] = useState(null) // tabla de la consulta que produjo `result`
+  const [activeTable, setActiveTable] = useState(null) // breadcrumb + nodo activo del árbol
+  const [history, setHistory] = useState(loadHistory) // últimas consultas exitosas
+  const [sidebarOpen, setSidebarOpen] = useState(loadSidebarOpen)
   const [tab, setTab] = useState('Resultados')
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarOpen((prev) => {
+      localStorage.setItem(SIDEBAR_KEY, prev ? '0' : '1')
+      return !prev
+    })
+  }, [])
 
   // CSV: resultado/estado de carga por tabla, y estado del asistente "Nuevo desde CSV".
   const [csvUploads, setCsvUploads] = useState({}) // { [tabla]: {loading?, result?, error?} }
@@ -71,6 +110,21 @@ export default function App() {
       if (data.ok) {
         setResult(data)
         setLastSql(query)
+        const name = extractTableName(query)
+        setLastTable(name)
+        // Historial: sin duplicados consecutivos, tope HISTORY_MAX.
+        setHistory((prev) => {
+          const next = (prev[0] === query ? prev : [query, ...prev]).slice(0, HISTORY_MAX)
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(next))
+          return next
+        })
+        // Breadcrumb: la tabla de la consulta pasa a ser la activa;
+        // si se eliminó la tabla activa, se vuelve a `minidb`.
+        if (data.kind === 'drop_table') {
+          setActiveTable((prev) => (prev === data.table ? null : prev))
+        } else if (name) {
+          setActiveTable(name)
+        }
         // Refrescar metadatos si el esquema pudo cambiar.
         if (['create_table', 'create_index', 'insert', 'delete', 'drop_table'].includes(data.kind)) {
           loadTables()
@@ -108,12 +162,14 @@ export default function App() {
     setResult(null)
     setQueryError(null)
     setLastSql('')
+    setLastTable(null)
   }, [])
 
   const selectTable = useCallback(
     (name) => {
       setSql(`SELECT * FROM ${name} LIMIT 100;`)
       setQueryError(null)
+      setActiveTable(name)
     },
     [],
   )
@@ -181,31 +237,70 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-canvas">
-      <TopNav health={health} theme={theme} onToggleTheme={toggleTheme} />
+      <TopNav
+        health={health}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        activeTable={activeTable}
+        sidebarOpen={sidebarOpen}
+        onToggleSidebar={toggleSidebar}
+      />
 
       <main className="mx-auto max-w-[1200px] px-4 py-6 sm:px-6">
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-[300px_1fr]">
-          <Sidebar
-            tables={tables}
-            loading={tablesLoading}
-            error={tablesError}
-            onRefresh={loadTables}
-            onSelectTable={selectTable}
-            csvUploads={csvUploads}
-            onUploadCsv={uploadCsvToTable}
-            onDismissCsv={dismissCsv}
-            infer={infer}
-            onInfer={inferFromCsv}
-            onClearInfer={() => setInfer(null)}
-          />
+        <div
+          className={`grid grid-cols-1 gap-5 transition-[grid-template-columns] duration-200 ${
+            sidebarOpen ? 'lg:grid-cols-[300px_1fr]' : 'lg:grid-cols-[48px_1fr]'
+          }`}
+        >
+          {sidebarOpen ? (
+            <Sidebar
+              tables={tables}
+              loading={tablesLoading}
+              error={tablesError}
+              onRefresh={loadTables}
+              onSelectTable={selectTable}
+              activeTable={activeTable}
+              csvUploads={csvUploads}
+              onUploadCsv={uploadCsvToTable}
+              onDismissCsv={dismissCsv}
+              infer={infer}
+              onInfer={inferFromCsv}
+              onClearInfer={() => setInfer(null)}
+            />
+          ) : (
+            // Riel colapsado: botón vertical para reabrir el panel.
+            <aside className="flex rounded-card border border-hairline bg-surface shadow-card lg:w-12 lg:flex-col lg:items-center lg:py-3">
+              <button
+                type="button"
+                onClick={toggleSidebar}
+                title="Mostrar panel de archivos"
+                aria-label="Mostrar panel de archivos"
+                className="mx-auto rounded-full p-1.5 text-body transition-colors hover:bg-canvas hover:text-ink"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <path d="M9 6l6 6-6 6" />
+                </svg>
+              </button>
+            </aside>
+          )}
 
-          <div className="flex flex-col gap-5">
+          <div className="flex min-w-0 flex-col gap-5">
             <SqlEditor
               sql={sql}
               setSql={setSql}
               onExecute={execute}
               onClear={clearAll}
               executing={executing}
+              history={history}
             />
 
             {queryError && (
@@ -230,7 +325,7 @@ export default function App() {
                 ))}
               </div>
 
-              {tab === 'Resultados' && <ResultsTable result={result} />}
+              {tab === 'Resultados' && <ResultsTable result={result} tableName={lastTable} />}
               {tab === 'Plan' && <PlanPanel result={result} />}
               {tab === 'Mapa' && <MapPanel result={result} sql={lastSql} theme={theme} />}
             </section>

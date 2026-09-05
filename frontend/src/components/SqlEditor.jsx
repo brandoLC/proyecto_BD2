@@ -1,48 +1,34 @@
-// Editor SQL con botón Ejecutar (Ctrl+Enter), Limpiar y consultas de ejemplo.
+// Editor SQL con botón Ejecutar (Ctrl+Enter), Limpiar, consultas de
+// ejemplo y dropdown de historial (últimas consultas exitosas).
 const EXAMPLES = [
   {
-    label: 'CREATE TABLE con POINT',
-    sql: `CREATE TABLE restaurantes (\n  id INT PRIMARY KEY,\n  nombre VARCHAR(50),\n  rating FLOAT,\n  location POINT\n);`,
+    label: 'KNN: 5 restaurantes cerca de (-76.8, 39.2)',
+    sql: `SELECT name, city FROM fast_food_restaurants_usa WHERE location KNN ((-76.8, 39.2), 5);`,
   },
   {
-    label: 'CREATE INDEX BTREE (la PK ya trae uno)',
-    sql: `CREATE INDEX idx_rating ON restaurantes (rating) USING BTREE;`,
+    label: 'Radio espacial: 0.5° alrededor de (-76.8, 39.2)',
+    sql: `SELECT name, city FROM fast_food_restaurants_usa WHERE location IN ((-76.8, 39.2), 0.5);`,
   },
   {
-    label: 'CREATE INDEX HASH',
-    sql: `CREATE INDEX idx_nombre ON restaurantes (nombre) USING HASH;`,
+    label: 'Rango con B+Tree sobre big_test',
+    sql: `SELECT * FROM big_test WHERE id BETWEEN 1000 AND 1050;`,
   },
   {
-    label: 'CREATE INDEX RTREE',
-    sql: `CREATE INDEX idx_location ON restaurantes (location) USING RTREE;`,
+    label: 'Búsqueda por show_id en netflix_titles',
+    sql: `SELECT title, director, release_year FROM netflix_titles WHERE show_id = 's1';`,
   },
   {
-    label: 'INSERT',
-    sql: `INSERT INTO restaurantes VALUES (1, 'Punto Azul', 4.5, (-12.05, -77.04));`,
-  },
-  {
-    label: 'SELECT por clave primaria',
-    sql: `SELECT * FROM restaurantes WHERE id = 1;`,
-  },
-  {
-    label: 'SELECT rango BETWEEN',
-    sql: `SELECT * FROM restaurantes WHERE rating BETWEEN 4.0 AND 4.8;`,
-  },
-  {
-    label: 'Búsqueda espacial por radio',
-    sql: `SELECT * FROM restaurantes WHERE location IN ((-12.05, -77.04), 0.02);`,
-  },
-  {
-    label: 'Búsqueda espacial KNN',
-    sql: `SELECT * FROM restaurantes WHERE location KNN ((-12.05, -77.04), 5);`,
-  },
-  {
-    label: 'DELETE',
-    sql: `DELETE FROM restaurantes WHERE id = 1;`,
+    label: 'CREATE TABLE desde CSV',
+    sql: `CREATE TABLE restaurantes FROM FILE "restaurantes.csv";`,
   },
 ]
 
-export default function SqlEditor({ sql, setSql, onExecute, onClear, executing }) {
+function shortLabel(q) {
+  const oneLine = q.replace(/\s+/g, ' ').trim()
+  return oneLine.length > 60 ? `${oneLine.slice(0, 57)}…` : oneLine
+}
+
+export default function SqlEditor({ sql, setSql, onExecute, onClear, executing, history = [] }) {
   const handleKeyDown = (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault()
@@ -58,24 +44,50 @@ export default function SqlEditor({ sql, setSql, onExecute, onClear, executing }
     }
   }
 
+  const handleHistory = (e) => {
+    const idx = e.target.value
+    if (idx !== '') {
+      setSql(history[Number(idx)])
+      e.target.value = ''
+    }
+  }
+
   return (
     <section className="rounded-card border border-hairline bg-surface p-6 shadow-card">
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-3 flex items-center justify-between gap-2">
         <h2 className="text-[15px]">Consultas SQL</h2>
-        <select
-          defaultValue=""
-          onChange={handleExample}
-          className="rounded-input border border-hairline bg-surface px-2 py-1 text-xs text-body outline-none focus:border-border-strong"
-        >
-          <option value="" disabled>
-            Ejemplos…
-          </option>
-          {EXAMPLES.map((ex, i) => (
-            <option key={ex.label} value={i}>
-              {ex.label}
+        <div className="flex items-center gap-2">
+          <select
+            defaultValue=""
+            onChange={handleHistory}
+            disabled={history.length === 0}
+            title="Historial de consultas ejecutadas con éxito"
+            className="max-w-36 rounded-input border border-hairline bg-surface px-2 py-1 text-xs text-body outline-none focus:border-border-strong disabled:opacity-50"
+          >
+            <option value="" disabled>
+              Historial…
             </option>
-          ))}
-        </select>
+            {history.map((q, i) => (
+              <option key={i} value={i}>
+                {shortLabel(q)}
+              </option>
+            ))}
+          </select>
+          <select
+            defaultValue=""
+            onChange={handleExample}
+            className="rounded-input border border-hairline bg-surface px-2 py-1 text-xs text-body outline-none focus:border-border-strong"
+          >
+            <option value="" disabled>
+              Ejemplos…
+            </option>
+            {EXAMPLES.map((ex, i) => (
+              <option key={ex.label} value={i}>
+                {ex.label}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       <textarea
