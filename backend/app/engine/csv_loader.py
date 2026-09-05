@@ -294,12 +294,24 @@ def map_columns(header: list[str],
                 table_columns: list[Column]) -> tuple[list[int], list[str]]:
     """Mapea la cabecera del CSV a las columnas de la tabla por nombre.
 
+    Las cabeceras se normalizan con ``sanitize_identifier`` (el mismo
+    criterio con el que la inferencia genera los nombres de columna), así
+    un CSV con tildes o espacios ("Código Modular") coincide con la
+    columna ``c_digo_modular`` de la tabla.
+
     Devuelve ``(posiciones, ignoradas)``: la posición en la fila CSV de
     cada columna de la tabla (en el orden del esquema) y los nombres de
     las columnas del CSV que la tabla no tiene. Lanza ``ValueError`` si
     falta alguna columna requerida.
     """
-    by_name = {h.strip().lower(): i for i, h in enumerate(header)}
+    by_name: dict[str, int] = {}
+    for i, h in enumerate(header):
+        name = sanitize_identifier(h)
+        if name in by_name:
+            raise ValueError(
+                f"dos columnas del CSV se traducen al mismo nombre "
+                f"'{name}' ('{header[by_name[name]]}' y '{h}')")
+        by_name[name] = i
     positions: list[int] = []
     used: set[int] = set()
     for col in table_columns:

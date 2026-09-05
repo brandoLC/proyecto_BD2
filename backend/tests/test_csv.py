@@ -11,6 +11,7 @@ from app.engine.csv_loader import (
     detect_point_pair,
     derive_point_value,
     infer_columns,
+    map_columns,
     read_csv,
     sanitize_identifier,
 )
@@ -232,6 +233,32 @@ class TestLecturaYCasteo:
         assert cast_csv_value("hola", col) == "hola"
         with pytest.raises(ValueError, match="excede VARCHAR"):
             cast_csv_value("demasiado largo", col)
+
+
+class TestMapColumns:
+    def test_cabeceras_con_tildes_y_espacios(self):
+        header = ["Código Modular", "Nivel / Modalidad", "Dirección"]
+        cols = [Column("c_digo_modular", "INT"),
+                Column("nivel___modalidad", "VARCHAR", 50),
+                Column("direcci_n", "VARCHAR", 100)]
+        positions, ignored = map_columns(header, cols)
+        assert positions == [0, 1, 2]
+        assert ignored == []
+
+    def test_columnas_extra_del_csv_se_ignoran(self):
+        header = ["id", "Nombre", "extra"]
+        cols = [Column("id", "INT"), Column("nombre", "VARCHAR", 50)]
+        positions, ignored = map_columns(header, cols)
+        assert positions == [0, 1]
+        assert ignored == ["extra"]
+
+    def test_falta_columna_requerida(self):
+        with pytest.raises(ValueError, match="falta la columna requerida"):
+            map_columns(["id"], [Column("id", "INT"), Column("nom", "INT")])
+
+    def test_colision_tras_sanitizar(self):
+        with pytest.raises(ValueError, match="mismo nombre"):
+            map_columns(["Código", "C digo"], [Column("c_digo", "INT")])
 
 
 # ----------------------------------------------------------------------
