@@ -13,10 +13,12 @@ import os
 import time
 
 from fastapi import APIRouter, File, Form, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ..engine.csv_loader import (
     CSVError,
+    analyze_columns,
     column_position,
     decode_csv_bytes,
     detect_point_pair,
@@ -25,6 +27,7 @@ from ..engine.csv_loader import (
     read_csv,
     reorder_row,
     sanitize_identifier,
+    suggest_pk,
     suggested_create_sql,
 )
 from ..engine.executor import Engine
@@ -51,11 +54,17 @@ def tables() -> dict:
 
 
 @router.post("/query")
-def query(req: QueryRequest) -> dict:
+def query(req: QueryRequest):
     if not req.sql or not req.sql.strip():
         return {"ok": False, "error": "la sentencia SQL está vacía",
                 "stage": "parse"}
-    return engine.execute(req.sql)
+    result = engine.execute(req.sql)
+    if (not result.get("ok") and result.get("stage") == "semantic"
+            and "ya existe" in result.get("error", "")):
+        # Tabla (o índice) ya existente: conflicto 4xx con el mismo cuerpo
+        # {ok, error, stage} que el resto de errores de la API.
+        return JSONResponse(status_code=409, content=result)
+    return result
 
 
 @router.post("/infer-schema")
@@ -73,6 +82,7 @@ async def infer_schema(file: UploadFile = File(...),
         base = os.path.splitext(os.path.basename(file.filename or ""))[0]
         name = sanitize_identifier(base or "tabla")
     columns = infer_columns(header, [r for _, r in rows])
+    stats = analyze_columns(header, rows)
     det = detect_point_pair(header, columns, [r for _, r in rows])
     sql_columns = columns
     notes: list[str] = []
@@ -81,19 +91,29 @@ async def infer_schema(file: UploadFile = File(...),
         notes.append(
             f"columna '{det['column']}' (POINT) derivada de "
             f"'{det['lat_col']}' + '{det['lng_col']}'")
-    return {
+    response = {
         "ok": True,
         "table_name": name,
+        "table": name,  # alias del nombre sanitizado de la tabla
         "columns": [
-            {"name": c.name, "type": c.type_str(), "primary_key": c.primary_key}
-            for c in columns
+            {"name": c.name, "type": c.type_str(), "primary_key": c.primary_key,
+             "auto": False, "nulls": s["nulls"],
+             "duplicates": s["duplicates"],
+             "sample_values": s["sample_values"]}
+            for c, s in zip(columns, stats)
         ],
         "suggested_sql": suggested_create_sql(name, sql_columns),
         "preview_rows": [row for _, row in rows[:5]],
+        "preview": [dict(zip(header, row)) for _, row in rows[:5]],
         "total_rows_estimate": len(rows),
+        "row_count": len(rows),
+        "suggested_pk": suggest_pk(columns, stats),
         "derived_point": det,
         "notes": notes,
     }
+    if engine.catalog.has_table(name):
+        response["table_exists"] = True
+    return response
 
 
 @router.post("/tables/{name}/upload-csv")
@@ -152,10 +172,12 @@ async def upload_csv(name: str, file: UploadFile = File(...),
                     "stage": "semantic"}
 
     try:
+        auto_names = {c.name for c in columns if c.auto}
         positions, ignored = map_columns(
             header,
             [c for c in columns if c is not point_col]
-            if point_col is not None else columns)
+            if point_col is not None else columns,
+            optional=auto_names)
     except ValueError as exc:
         return {"ok": False, "error": str(exc), "stage": "semantic"}
     if point_col is not None:

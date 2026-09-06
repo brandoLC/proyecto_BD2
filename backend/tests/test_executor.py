@@ -20,6 +20,107 @@ def plan_names(result):
     return [s["name"] for s in result["plan"]]
 
 
+class TestPKImplicita:
+    """CREATE TABLE sin PRIMARY KEY declara agrega una columna SERIAL
+    autogenerada (``id``, o ``_minidb_id`` si ``id`` ya existe)."""
+
+    def test_create_sin_pk_agrega_serial(self, engine):
+        r = q(engine, "CREATE TABLE autos (nombre VARCHAR(30), precio FLOAT);")
+        assert r["ok"]
+        cols = engine.catalog.columns("autos")
+        assert cols[0].name == "id" and cols[0].auto and cols[0].primary_key
+        assert [c.name for c in cols] == ["id", "nombre", "precio"]
+        info = engine.table_info()[0]
+        assert info["columns"][0] == {"name": "id", "type": "SERIAL",
+                                      "primary_key": True, "auto": True}
+        # La PK lleva su B+ Tree automático (como toda PK explícita)
+        assert info["indexes"] == [{"name": "autos_id_pk", "column": "id",
+                                    "type": "BTREE"}]
+
+    def test_insert_autoasigna_y_select_muestra(self, engine):
+        q(engine, "CREATE TABLE autos (nombre VARCHAR(30));")
+        for n in ("La Mar", "Central", "Maido"):
+            r = q(engine, f"INSERT INTO autos VALUES ('{n}');")
+            assert r["ok"]
+        r = q(engine, "SELECT * FROM autos;")
+        assert [row[0] for row in r["rows"]] == [1, 2, 3]
+        assert r["rows"][1] == [2, "Central"]
+        # búsqueda por la PK implícita usa el B+ Tree
+        r = q(engine, "SELECT nombre FROM autos WHERE id = 3;")
+        assert r["rows"] == [["Maido"]]
+        assert "Index Scan" in plan_names(r)
+
+    def test_insert_con_id_explicito_adelanta_secuencia(self, engine):
+        q(engine, "CREATE TABLE t (v INT);")
+        q(engine, "INSERT INTO t VALUES (10);")      # auto: id = 1
+        q(engine, "INSERT INTO t VALUES (50, 20);")  # id explícito 50
+        q(engine, "INSERT INTO t VALUES (30);")      # auto: id = 51
+        r = q(engine, "SELECT * FROM t;")
+        assert [row[0] for row in r["rows"]] == [1, 50, 51]
+
+    def test_id_explicito_duplicado_rechazado(self, engine):
+        q(engine, "CREATE TABLE t (v INT);")
+        q(engine, "INSERT INTO t VALUES (5, 1);")
+        r = q(engine, "INSERT INTO t VALUES (5, 2);")
+        assert not r["ok"] and "clave primaria duplicada" in r["error"]
+
+    def test_nombre_reservado_usa_minidb_id(self, engine):
+        r = q(engine, "CREATE TABLE t (id VARCHAR(10), v INT);")
+        assert r["ok"]
+        cols = engine.catalog.columns("t")
+        assert cols[0].name == "_minidb_id" and cols[0].auto
+        q(engine, "INSERT INTO t VALUES ('abc', 7);")
+        r = q(engine, "SELECT * FROM t;")
+        assert r["rows"] == [[1, "abc", 7]]
+
+    def test_pk_explicita_no_agrega_columna(self, engine):
+        q(engine, "CREATE TABLE t (codigo INT PRIMARY KEY, v INT);")
+        cols = engine.catalog.columns("t")
+        assert len(cols) == 2 and all(not c.auto for c in cols)
+        assert q(engine, "INSERT INTO t VALUES (1, 2);")["ok"]
+        # la PK explícita no es autoasignable: faltan valores
+        r = q(engine, "INSERT INTO t VALUES (3);")
+        assert not r["ok"]
+
+    def test_secuencia_persiste_entre_instancias(self, tmp_path):
+        data = str(tmp_path / "data")
+        e1 = Engine(data)
+        q(e1, "CREATE TABLE t (v INT);")
+        q(e1, "INSERT INTO t VALUES (1);")
+        q(e1, "INSERT INTO t VALUES (2);")
+        e2 = Engine(data)  # recarga catálogo + secuencia desde disco
+        q(e2, "INSERT INTO t VALUES (3);")
+        r = q(e2, "SELECT * FROM t;")
+        assert [row[0] for row in r["rows"]] == [1, 2, 3]
+
+    def test_indices_funcionan_con_pk_implicita(self, engine):
+        q(engine, "CREATE TABLE rest (nombre VARCHAR(30), precio FLOAT, "
+                  "ubicacion POINT);")
+        q(engine, "CREATE INDEX idx_precio ON rest (precio) USING BTREE;")
+        q(engine, "CREATE INDEX idx_ubi ON rest (ubicacion) USING RTREE;")
+        datos = [("A", 10.0, (-12.0, -77.0)), ("B", 20.0, (-12.1, -77.1)),
+                 ("C", 30.0, (-12.2, -77.2))]
+        for n, p, (x, y) in datos:
+            r = q(engine, f"INSERT INTO rest VALUES ('{n}', {p}, ({x}, {y}));")
+            assert r["ok"]
+        r = q(engine, "SELECT nombre FROM rest WHERE precio = 20.0;")
+        assert r["rows"] == [["B"]]
+        assert "Index Scan" in plan_names(r)
+        r = q(engine, "SELECT nombre FROM rest WHERE id BETWEEN 1 AND 2;")
+        assert sorted(row[0] for row in r["rows"]) == ["A", "B"]
+        assert "Index Range Scan" in plan_names(r)
+        r = q(engine, "SELECT nombre FROM rest WHERE ubicacion "
+                      "KNN ((-12.0, -77.0), 1);")
+        assert r["rows"][0] == ["A"]
+        assert "R-Tree KNN Search" in plan_names(r)
+
+    def test_tabla_duplicada_error_claro(self, engine):
+        q(engine, "CREATE TABLE t (v INT);")
+        r = q(engine, "CREATE TABLE t (v INT);")
+        assert not r["ok"] and r["stage"] == "semantic"
+        assert r["error"] == "la tabla 't' ya existe"
+
+
 class TestFlujoCompleto:
     def test_create_insert_select_delete(self, engine):
         r = q(engine, "CREATE TABLE rest (id INT PRIMARY KEY, "
@@ -155,7 +256,7 @@ class TestFlujoCompleto:
         assert t["name"] == "t"
         assert t["rowcount"] == 1
         assert t["columns"][0] == {"name": "id", "type": "INT",
-                                   "primary_key": True}
+                                   "primary_key": True, "auto": False}
         assert t["columns"][1]["type"] == "POINT"
         # Índice B+ Tree automático de la PRIMARY KEY
         assert t["indexes"] == [{"name": "t_id_pk", "column": "id",

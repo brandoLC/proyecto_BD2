@@ -63,6 +63,11 @@ SQL → parser (tokenizer + recursivo descendente, AST)
 ```sql
 CREATE TABLE nombre (col TIPO [PRIMARY KEY], ...);
 -- TIPO: INT | FLOAT | VARCHAR(n) | TEXT | BOOL | POINT  (POINT = dos floats x,y)
+-- Si no se declara PRIMARY KEY, el motor agrega una implícita SERIAL
+-- autoincremental: `id INT PRIMARY KEY (auto)` (o `_minidb_id` si `id`
+-- ya existe). Va primera en el esquema; un INSERT que no la menciona
+-- (un valor menos) la autoasigna, y en DESCRIBE/GET /api/tables aparece
+-- con `auto: true` y type `SERIAL`.
 
 CREATE INDEX [nombre] ON tabla (col) USING BTREE|HASH|RTREE;
 -- RTREE solo sobre columnas POINT; BTREE/HASH sobre columnas escalares
@@ -80,7 +85,9 @@ DELETE FROM t WHERE col = lit;
 
 CREATE TABLE nombre FROM FILE "archivo.csv";
 -- infiere el esquema del CSV (en DATASETS_DIR), crea la tabla con la PK
--- sugerida (si la hay) y carga todas las filas válidas a granel
+-- sugerida (si la hay) o con la PK implícita SERIAL `id`, y carga todas
+-- las filas válidas a granel; si el CSV no trae la columna autogenerada
+-- (o la trae vacía), el id se autoasigna secuencialmente
 
 LOAD INTO tabla FROM FILE "archivo.csv";
 -- carga un CSV en una tabla existente, mapeando columnas por nombre
@@ -119,6 +126,8 @@ Convenciones del formato:
   línea 1) y el motivo; se conservan hasta 50 errores. Las columnas del
   CSV que la tabla no tiene se ignoran y se listan en
   `ignored_columns`; si falta una columna requerida, toda la carga falla.
+  La columna autogenerada de la PK implícita (`id`/`_minidb_id`) no es
+  requerida: si el CSV no la trae o viene vacía, su valor se autoasigna.
 
 ### Columna POINT derivada de latitud/longitud
 
@@ -150,10 +159,19 @@ inferencia y ofrece/crea una columna `POINT` derivada:
 
 - `POST /api/infer-schema` (multipart, campo `file`, opcional
   `table_name`) → infiere el esquema sin crear nada:
-  `{"ok", "table_name", "columns": [{"name", "type", "primary_key"}],
-  "suggested_sql", "preview_rows" (5 primeras filas crudas),
-  "total_rows_estimate", "derived_point", "notes"}`. Si se detecta un
-  par lat/lng, `derived_point` es
+  `{"ok", "table_name", "table" (alias), "columns": [{"name", "type",
+  "primary_key", "auto", "nulls", "duplicates", "sample_values"}],
+  "suggested_sql", "preview_rows" (5 primeras filas crudas como listas),
+  "preview" (las mismas filas como objetos `cabecera -> valor`),
+  "total_rows_estimate", "row_count" (alias), "suggested_pk",
+  "derived_point", "notes"}`. `nulls` cuenta celdas vacías por columna y
+  `duplicates` los valores repetidos sobre las no vacías (de todo el
+  archivo); `suggested_pk` es la columna `id`/`uuid`/`id_*` sin nulos ni
+  duplicados, si no la primera columna limpia, si no `null`. Si la tabla
+  ya existe en la base de datos se incluye `"table_exists": true`. El
+  CSV se decodifica como UTF-8 (con BOM) y reintenta con Latin-1; el
+  separador se detecta con `csv.Sniffer` (`,`, `;`, tab o `|`).
+  Si se detecta un par lat/lng, `derived_point` es
   `{"column": "location", "lat_col": "latitude", "lng_col": "longitude"}`
   (`null` si no), `suggested_sql` termina con la columna derivada
   (`..., location POINT);`) y `notes` lo explica (lista vacía si no).
@@ -198,13 +216,15 @@ python -m pytest tests/ -q
 ## API REST
 
 - `GET /api/health` → `{"status": "ok"}`
-- `GET /api/tables` → tablas con columnas, índices, `rowcount` y archivos
-  (`path`, `size_bytes`, `pages`)
+- `GET /api/tables` → tablas con columnas (`name`, `type`, `primary_key`,
+  `auto`), índices, `rowcount` y archivos (`path`, `size_bytes`, `pages`)
 - `POST /api/query` con `{"sql": "..."}` → resultado con `ok`, `kind`,
   `columns`/`rows` (select), `rowcount`, `message`, `plan` (pasos con
   tiempos), `elapsed_ms` y `spatial` (puntos cuando el resultado incluye
   una columna POINT, si no `null`). En error: `{"ok": false, "error",
-  "stage": "parse|semantic|execution"}`.
+  "stage": "parse|semantic|execution"}`; cuando la tabla (o el índice)
+  ya existe, además del cuerpo de error habitual se responde con
+  **HTTP 409** (el frontend ya maneja este caso devolviendo el cuerpo).
 
 ## Sesión de ejemplo
 

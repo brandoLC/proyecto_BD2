@@ -40,10 +40,13 @@ class Column:
     type: str
     size: int | None = None  # solo para VARCHAR(n)
     primary_key: bool = False
+    auto: bool = False  # True en la PK implícita SERIAL (autogenerada)
 
     def type_str(self) -> str:
         if self.type == TYPE_VARCHAR:
             return f"VARCHAR({self.size})"
+        if self.auto:
+            return "SERIAL"
         return self.type
 
     def to_dict(self) -> dict:
@@ -52,6 +55,7 @@ class Column:
             "type": self.type,
             "size": self.size,
             "primary_key": self.primary_key,
+            "auto": self.auto,
         }
 
     @classmethod
@@ -61,6 +65,7 @@ class Column:
             type=d["type"],
             size=d.get("size"),
             primary_key=bool(d.get("primary_key", False)),
+            auto=bool(d.get("auto", False)),
         )
 
 

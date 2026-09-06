@@ -8,11 +8,28 @@ import StatusMessage from './components/StatusMessage.jsx'
 import ResultsTable from './components/ResultsTable.jsx'
 import PlanPanel from './components/PlanPanel.jsx'
 import MapPanel from './components/MapPanel.jsx'
+import InferSchemaModal from './components/InferSchemaModal.jsx'
 
 const TABS = ['Resultados', 'Plan', 'Mapa']
 const HISTORY_KEY = 'minidb:history'
 const HISTORY_MAX = 20
 const SIDEBAR_KEY = 'minidb:sidebar'
+
+// Genera el CREATE TABLE en el editor a partir de la inferencia, con la
+// PRIMARY KEY elegida en el modal (null = sin PK, el motor la genera solo).
+// Replica el formato de suggested_create_sql del backend, incluida la
+// columna POINT derivada si la hay.
+function buildCreateSql(data, pk) {
+  const table = data?.table_name ?? data?.table ?? 'tabla'
+  const cols = [...(data?.columns || [])]
+  if (data?.derived_point) {
+    cols.push({ name: data.derived_point.column, type: 'POINT' })
+  }
+  const defs = cols.map(
+    (c) => `${c.name} ${c.type || 'TEXT'}` + (pk && c.name === pk ? ' PRIMARY KEY' : ''),
+  )
+  return `CREATE TABLE ${table} (${defs.join(', ')});`
+}
 
 // Extrae la tabla afectada por una sentencia del subconjunto MiniDB.
 function extractTableName(query) {
@@ -67,6 +84,7 @@ export default function App() {
   // CSV: resultado/estado de carga por tabla, y estado del asistente "Nuevo desde CSV".
   const [csvUploads, setCsvUploads] = useState({}) // { [tabla]: {loading?, result?, error?} }
   const [infer, setInfer] = useState(null) // null | {loading} | {data} | {error:{error,stage}}
+  const [inferModalOpen, setInferModalOpen] = useState(false)
   // Columna POINT derivada por tabla inferida: { [tabla]: {column, lat_col, lng_col} }
   const [derivedPoints, setDerivedPoints] = useState({})
 
@@ -209,12 +227,12 @@ export default function App() {
   const inferFromCsv = useCallback(async (file) => {
     if (!file) return
     setInfer({ loading: true })
+    setInferModalOpen(false)
     try {
       const data = await inferSchema(file)
       if (data.ok) {
         setInfer({ data })
-        setSql(data.suggested_sql) // cargar el CREATE TABLE sugerido en el editor
-        setQueryError(null)
+        setInferModalOpen(true) // el modal decide la PK y luego pre-llena el editor
         // Recordar la columna POINT derivada para la carga CSV posterior.
         if (data.derived_point) {
           setDerivedPoints((prev) => ({ ...prev, [data.table_name]: data.derived_point }))
@@ -226,6 +244,18 @@ export default function App() {
       setInfer({ error: { error: `Error de red: ${e.message}`, stage: null } })
     }
   }, [])
+
+  const applyInfer = useCallback(
+    (pk) => {
+      if (!infer?.data) return
+      setSql(buildCreateSql(infer.data, pk))
+      setQueryError(null)
+      setInferModalOpen(false)
+    },
+    [infer],
+  )
+
+  const closeInferModal = useCallback(() => setInferModalOpen(false), [])
 
   const dismissCsv = useCallback((name) => {
     setCsvUploads((prev) => {
@@ -246,7 +276,7 @@ export default function App() {
         onToggleSidebar={toggleSidebar}
       />
 
-      <main className="mx-auto max-w-[1200px] px-4 py-6 sm:px-6">
+      <main className="px-4 py-6 sm:px-6">
         <div
           className={`grid grid-cols-1 gap-5 transition-[grid-template-columns] duration-200 ${
             sidebarOpen ? 'lg:grid-cols-[300px_1fr]' : 'lg:grid-cols-[48px_1fr]'
@@ -265,7 +295,10 @@ export default function App() {
               onDismissCsv={dismissCsv}
               infer={infer}
               onInfer={inferFromCsv}
-              onClearInfer={() => setInfer(null)}
+              onClearInfer={() => {
+                setInfer(null)
+                setInferModalOpen(false)
+              }}
             />
           ) : (
             // Riel colapsado: botón vertical para reabrir el panel.
@@ -332,6 +365,14 @@ export default function App() {
           </div>
         </div>
       </main>
+
+      {inferModalOpen && infer?.data && (
+        <InferSchemaModal
+          data={infer.data}
+          onApply={applyInfer}
+          onClose={closeInferModal}
+        />
+      )}
     </div>
   )
 }

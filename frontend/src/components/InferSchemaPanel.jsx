@@ -117,8 +117,8 @@ export default function InferSchemaPanel({ infer, onClose }) {
           )}
 
           <p className="rounded-input border border-accent/40 bg-highlight/30 px-3 py-2 text-[11px] text-body">
-            Revisa y ejecuta el CREATE TABLE sugerido, luego usa 'Cargar CSV' en la tabla
-            creada.
+            Elige la PRIMARY KEY en el asistente, pulsa 'Aplicar' y ejecuta el
+            CREATE TABLE en el editor; luego usa 'Cargar CSV' en la tabla creada.
           </p>
         </div>
       )}

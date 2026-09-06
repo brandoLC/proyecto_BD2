@@ -48,11 +48,27 @@ class Catalog:
         self._data["tables"][name] = {
             "columns": [c.to_dict() for c in columns],
             "indexes": [],
+            "auto_seq": 1,  # siguiente valor de la PK implícita SERIAL
         }
         self._save()
 
     def drop_table(self, name: str) -> None:
         del self._data["tables"][name]
+        self._save()
+
+    # ------------------------------------------------------------------
+    # Secuencia de la PK autoincremental
+    # ------------------------------------------------------------------
+    def auto_seq(self, table: str) -> int:
+        """Próximo valor a asignar por la columna auto de la tabla."""
+        return int(self._data["tables"][table].get("auto_seq", 1))
+
+    def set_auto_seq(self, table: str, value: int) -> None:
+        """Actualiza la secuencia en memoria (sin persistir todavía)."""
+        self._data["tables"][table]["auto_seq"] = value
+
+    def save(self) -> None:
+        """Persiste el catálogo (incluida la secuencia auto)."""
         self._save()
 
     def columns(self, table: str) -> list[Column]:

@@ -329,6 +329,150 @@ class TestInferSchemaEndpoint:
 
 
 # ----------------------------------------------------------------------
+# Endpoint POST /api/infer-schema (campos extendidos)
+# ----------------------------------------------------------------------
+class TestInferSchemaNuevosCampos:
+    CSV = (
+        "rank,restaurant,city,votes\n"
+        "1,Maido,Lima,100\n"
+        "2,Central,Lima,100\n"
+        "3,Astrid,Bogota,\n"
+        "4,Central,Lima,50\n"
+    )
+
+    def test_estadisticas_y_campos_nuevos(self, api):
+        client, _ = api
+        r = post_csv(client, "/api/infer-schema", self.CSV,
+                     filename="top50.csv")
+        assert r["ok"] is True
+        # aliases retrocompatibles + nuevos
+        assert r["table"] == "top50" and r["table_name"] == "top50"
+        assert r["row_count"] == 4 and r["total_rows_estimate"] == 4
+        cols = {c["name"]: c for c in r["columns"]}
+        assert cols["rank"]["nulls"] == 0 and cols["rank"]["duplicates"] == 0
+        assert cols["restaurant"]["duplicates"] == 1  # Central x2
+        assert cols["city"]["duplicates"] == 2        # Lima x3
+        assert cols["votes"]["nulls"] == 1
+        assert cols["rank"]["sample_values"] == ["1", "2", "3"]
+        # preview: primeras filas como dict de strings
+        assert r["preview"][0] == {"rank": "1", "restaurant": "Maido",
+                                   "city": "Lima", "votes": "100"}
+        assert len(r["preview"]) == 4
+        assert r["preview"][3]["restaurant"] == "Central"
+        # retrocompatibilidad: preview_rows sigue siendo lista de listas
+        assert r["preview_rows"][0][1] == "Maido"
+        assert r["suggested_pk"] == "rank"  # primera columna limpia
+
+    def test_suggested_pk_prefiere_columna_id(self, api):
+        client, _ = api
+        r = post_csv(client, "/api/infer-schema",
+                     "name,id_usuario,nota\na,1,5\nb,2,5\n")
+        assert r["suggested_pk"] == "id_usuario"
+        # duplicada aunque se llame id -> no sirve; cae en la primera limpia
+        r = post_csv(client, "/api/infer-schema",
+                     "codigo,id,nota\n7,1,5\n8,1,6\n9,3,7\n")
+        assert r["suggested_pk"] == "codigo"
+
+    def test_suggested_pk_null_sin_columna_limpia(self, api):
+        client, _ = api
+        r = post_csv(client, "/api/infer-schema",
+                     "a,b\nx,1\nx,1\ny,2\n")
+        assert r["suggested_pk"] is None
+
+    def test_table_exists(self, api):
+        client, engine = api
+        engine.execute("CREATE TABLE top50 (rank INT PRIMARY KEY);")
+        r = post_csv(client, "/api/infer-schema", self.CSV,
+                     filename="top50.csv")
+        assert r["ok"] and r["table_exists"] is True
+        r = post_csv(client, "/api/infer-schema", self.CSV,
+                     filename="otro.csv")
+        assert "table_exists" not in r
+
+    def test_csv_latin1(self, api):
+        client, _ = api
+        content = "nombre,ciudad\nNiño,São Paulo\n".encode("latin-1")
+        files = {"file": ("ninos.csv", content, "text/csv")}
+        r = client.post("/api/infer-schema", files=files).json()
+        assert r["ok"] is True
+        assert r["row_count"] == 1
+        assert r["preview"][0]["nombre"] == "Niño"
+        assert r["columns"][0]["name"] == "nombre"
+
+    def test_csv_punto_y_coma(self, api):
+        client, _ = api
+        r = post_csv(client, "/api/infer-schema", "a;b\n1;2\n3;4\n")
+        assert r["ok"] and r["row_count"] == 2
+        assert [c["name"] for c in r["columns"]] == ["a", "b"]
+
+
+# ----------------------------------------------------------------------
+# PK implícita en la carga de CSV y error 409 de tabla existente
+# ----------------------------------------------------------------------
+class TestUploadCSVPKImplicita:
+    def test_csv_sin_columna_id(self, api):
+        client, engine = api
+        engine.execute("CREATE TABLE rest (nombre VARCHAR(30), "
+                       "rating FLOAT);")  # PK implícita id
+        r = post_csv(client, "/api/tables/rest/upload-csv",
+                     "nombre,rating\nLa Mar,4.8\nCentral,4.9\n")
+        assert r["ok"] and r["rows_loaded"] == 2 and r["errors"] == []
+        sel = engine.execute("SELECT * FROM rest;")
+        assert sel["rows"] == [[1, "La Mar", 4.8], [2, "Central", 4.9]]
+
+    def test_csv_con_id_vacio_y_explicito(self, api):
+        client, engine = api
+        engine.execute("CREATE TABLE rest (nombre VARCHAR(30));")
+        csv_text = "id,nombre\n,La Mar\n,Central\n7,Rafael\n,Astrid\n"
+        r = post_csv(client, "/api/tables/rest/upload-csv", csv_text)
+        assert r["ok"] and r["rows_loaded"] == 4 and r["errors"] == []
+        sel = engine.execute("SELECT id, nombre FROM rest;")
+        # vacíos -> autoasignados; 7 explícito adelanta la secuencia
+        assert sel["rows"] == [[1, "La Mar"], [2, "Central"],
+                               [7, "Rafael"], [8, "Astrid"]]
+
+    def test_load_into_tabla_con_pk_implicita(self, engine_ds):
+        engine, ds = engine_ds
+        (ds / "mas.csv").write_text(
+            "nombre,rating\nRafael,4.2\nAstrid,4.1\n", encoding="utf-8")
+        engine.execute("CREATE TABLE rest (nombre VARCHAR(30), "
+                       "rating FLOAT);")
+        r = engine.execute('LOAD INTO rest FROM FILE "mas.csv";')
+        assert r["ok"] and r["rowcount"] == 2
+        sel = engine.execute("SELECT * FROM rest WHERE id = 2;")
+        assert sel["rows"] == [[2, "Astrid", 4.1]]
+        assert "Index Scan" in [s["name"] for s in sel["plan"]]
+
+    def test_from_file_sin_pk_en_csv(self, engine_ds):
+        engine, ds = engine_ds
+        (ds / "platos.csv").write_text(
+            "nombre,precio\nArroz,10.5\nLomo,25.0\n", encoding="utf-8")
+        r = engine.execute('CREATE TABLE platos FROM FILE "platos.csv";')
+        assert r["ok"]
+        assert "2 filas cargadas, 0 rechazadas" in r["message"]
+        pk = engine.catalog.primary_key("platos")
+        assert pk is not None and pk.name == "id" and pk.auto
+        sel = engine.execute("SELECT * FROM platos;")
+        assert sel["rows"] == [[1, "Arroz", 10.5], [2, "Lomo", 25.0]]
+
+    def test_create_table_duplicada_http_409(self, api):
+        client, engine = api
+        engine.execute("CREATE TABLE t (v INT);")
+        res = client.post("/api/query",
+                          json={"sql": "CREATE TABLE t (v INT);"})
+        assert res.status_code == 409
+        body = res.json()
+        assert body["ok"] is False and body["stage"] == "semantic"
+        assert body["error"] == "la tabla 't' ya existe"
+        # el resto de errores mantiene el estilo HTTP 200 de la API
+        res = client.post("/api/query", json={"sql": "SELECT * FROM nope;"})
+        assert res.status_code == 200 and res.json()["ok"] is False
+        res = client.post("/api/query",
+                          json={"sql": "CREATE TABLE t2 (v INT);"})
+        assert res.status_code == 200 and res.json()["ok"] is True
+
+
+# ----------------------------------------------------------------------
 # Endpoint POST /api/tables/{name}/upload-csv
 # ----------------------------------------------------------------------
 class TestUploadCSV:

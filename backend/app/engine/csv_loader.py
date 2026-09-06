@@ -291,7 +291,9 @@ def derive_point_value(lat_raw: str, lng_raw: str,
 # Mapeo y casteo para la carga
 # ----------------------------------------------------------------------
 def map_columns(header: list[str],
-                table_columns: list[Column]) -> tuple[list[int], list[str]]:
+                table_columns: list[Column],
+                optional: set[str] | None = None
+                ) -> tuple[list[int | None], list[str]]:
     """Mapea la cabecera del CSV a las columnas de la tabla por nombre.
 
     Las cabeceras se normalizan con ``sanitize_identifier`` (el mismo
@@ -300,10 +302,12 @@ def map_columns(header: list[str],
     columna ``c_digo_modular`` de la tabla.
 
     Devuelve ``(posiciones, ignoradas)``: la posición en la fila CSV de
-    cada columna de la tabla (en el orden del esquema) y los nombres de
-    las columnas del CSV que la tabla no tiene. Lanza ``ValueError`` si
-    falta alguna columna requerida.
+    cada columna de la tabla (en el orden del esquema; ``None`` para las
+    columnas de ``optional`` ausentes del CSV, p. ej. la PK autogenerada)
+    y los nombres de las columnas del CSV que la tabla no tiene. Lanza
+    ``ValueError`` si falta alguna columna requerida.
     """
+    optional = {o.lower() for o in optional} if optional else set()
     by_name: dict[str, int] = {}
     for i, h in enumerate(header):
         name = sanitize_identifier(h)
@@ -312,11 +316,14 @@ def map_columns(header: list[str],
                 f"dos columnas del CSV se traducen al mismo nombre "
                 f"'{name}' ('{header[by_name[name]]}' y '{h}')")
         by_name[name] = i
-    positions: list[int] = []
+    positions: list[int | None] = []
     used: set[int] = set()
     for col in table_columns:
         i = by_name.get(col.name.lower())
         if i is None:
+            if col.name.lower() in optional:
+                positions.append(None)
+                continue
             raise ValueError(
                 f"falta la columna requerida '{col.name}' en el CSV")
         positions.append(i)
@@ -325,9 +332,55 @@ def map_columns(header: list[str],
     return positions, ignored
 
 
-def reorder_row(raw: list[str], positions: list[int]) -> list[str]:
-    """Reordena una fila cruda según las posiciones del mapeo."""
-    return [raw[i] if i < len(raw) else "" for i in positions]
+def reorder_row(raw: list[str], positions: list[int | None]) -> list[str]:
+    """Reordena una fila cruda según las posiciones del mapeo.
+
+    Una posición ``None`` (columna opcional ausente del CSV) produce una
+    celda vacía.
+    """
+    return [raw[i] if i is not None and i < len(raw) else ""
+            for i in positions]
+
+
+def analyze_columns(header: list[str],
+                    rows: list[tuple[int, list[str]]]
+                    ) -> list[dict]:
+    """Estadísticas por columna sobre TODAS las filas del CSV.
+
+    Devuelve, alineado con ``header``: ``nulls`` (celdas vacías o
+    ausentes), ``duplicates`` (valores repetidos sobre los no vacíos) y
+    ``sample_values`` (hasta 3 valores no vacíos, como strings).
+    """
+    stats: list[dict] = []
+    for j in range(len(header)):
+        cells = [r[j] if j < len(r) else "" for _, r in rows]
+        nonempty = [v for v in cells if v.strip() != ""]
+        stats.append({
+            "nulls": len(cells) - len(nonempty),
+            "duplicates": len(nonempty) - len(set(nonempty)),
+            "sample_values": nonempty[:3],
+        })
+    return stats
+
+
+def suggest_pk(columns: list[Column], stats: list[dict]) -> str | None:
+    """Columna sugerida como PRIMARY KEY del CSV inferido.
+
+    Prefiere una columna llamada ``id``/``uuid``/``id_*`` (case-insensitive)
+    sin nulos ni duplicados; si no, la primera columna limpia; si ninguna
+    lo está, ``None``.
+    """
+    def clean(i: int) -> bool:
+        return stats[i]["nulls"] == 0 and stats[i]["duplicates"] == 0
+
+    for i, c in enumerate(columns):
+        n = c.name.lower()
+        if (n == "id" or n == "uuid" or n.startswith("id_")) and clean(i):
+            return c.name
+    for i in range(len(columns)):
+        if clean(i):
+            return columns[i].name
+    return None
 
 
 def cast_csv_value(raw: str, col: Column):

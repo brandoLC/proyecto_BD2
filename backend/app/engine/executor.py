@@ -21,6 +21,7 @@ from ..storage.heap_file import HeapFile
 from ..storage.record import (
     Column,
     SerializationError,
+    TYPE_INT,
     TYPE_POINT,
     coerce_value,
     decode_key,
@@ -84,6 +85,8 @@ class Engine:
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
         self.catalog = Catalog(data_dir)
+        self._auto_cache: dict[str, int] = {}  # siguiente valor por tabla
+        self._seq_dirty: set[str] = set()
 
     # ------------------------------------------------------------------
     # Archivos e índices
@@ -145,6 +148,8 @@ class Engine:
             return {"ok": False, "error": str(exc), "stage": "semantic"}
         except (ExecutionError, KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc), "stage": "execution"}
+        finally:
+            self._flush_seq()
 
         result["ok"] = True
         result["plan"] = plan.steps
@@ -214,6 +219,42 @@ class Engine:
         return col
 
     # ------------------------------------------------------------------
+    # Secuencia de la PK implícita (SERIAL)
+    # ------------------------------------------------------------------
+    def _next_auto_id(self, table: str) -> int:
+        """Asigna el siguiente entero de la columna autogenerada de la tabla."""
+        v = self._auto_cache.get(table, self.catalog.auto_seq(table))
+        self._auto_cache[table] = v + 1
+        self.catalog.set_auto_seq(table, v + 1)
+        self._seq_dirty.add(table)
+        return v
+
+    def _bump_auto_seq(self, table: str, value: int) -> None:
+        """Adelanta la secuencia cuando se inserta un id explícito mayor."""
+        cur = self._auto_cache.get(table, self.catalog.auto_seq(table))
+        if value >= cur:
+            self._auto_cache[table] = value + 1
+            self.catalog.set_auto_seq(table, value + 1)
+            self._seq_dirty.add(table)
+
+    def _flush_seq(self) -> None:
+        if self._seq_dirty:
+            self.catalog.save()
+            self._seq_dirty.clear()
+
+    @staticmethod
+    def _with_implicit_pk(columns: list[Column]) -> list[Column]:
+        """Agrega una PK autoincremental (SERIAL) si no se declaró ninguna.
+
+        La columna se llama ``id`` salvo que ya exista una columna con ese
+        nombre, en cuyo caso usa ``_minidb_id``. Se antepone al esquema.
+        """
+        if any(c.primary_key for c in columns):
+            return columns
+        name = "id" if "id" not in {c.name for c in columns} else "_minidb_id"
+        return [Column(name, TYPE_INT, primary_key=True, auto=True)] + columns
+
+    # ------------------------------------------------------------------
     # CREATE TABLE
     # ------------------------------------------------------------------
     def _exec_create_table(self, ast: dict, plan: _Plan) -> dict:
@@ -228,7 +269,11 @@ class Engine:
         names = [c.name for c in columns]
         if len(names) != len(set(names)):
             raise SemanticError("columnas con nombre duplicado")
-        plan.add("Semantic Check", f"esquema de '{table}' válido", t)
+        columns = self._with_implicit_pk(columns)
+        auto_pk = next((c.name for c in columns if c.auto), None)
+        plan.add("Semantic Check", f"esquema de '{table}' válido"
+                 + (f" (PK implícita {auto_pk} SERIAL)"
+                    if auto_pk else ""), t)
 
         t = time.perf_counter()
         heap = self._open_heap(table, create=True)
@@ -292,14 +337,17 @@ class Engine:
         header, rows = self._read_dataset_csv(filename)
         raw_rows = [r for _, r in rows]
         columns = infer_columns(header, raw_rows)
-        pk = next((c.name for c in columns if c.primary_key), None)
         det = detect_point_pair(header, columns, raw_rows)
         if det is not None:
             columns.append(Column(det["column"], TYPE_POINT))
+        columns = self._with_implicit_pk(columns)
+        pk = next((c.name for c in columns if c.primary_key), None)
+        auto_pk = next((c.name for c in columns if c.auto), None)
         plan.add(
             "Infer Schema",
             f"{len(columns)} columnas inferidas de '{filename}'"
             + (f", PK sugerida: {pk}" if pk else "")
+            + (f" (implícita, autogenerada)" if auto_pk else "")
             + (f", {det['column']} POINT derivada de "
                f"{det['lat_col']}+{det['lng_col']}" if det else ""), t)
 
@@ -314,15 +362,20 @@ class Engine:
         self._create_pk_index(table, columns, plan)
 
         t = time.perf_counter()
-        load_rows: list[tuple[int, list[str]]] = rows
+        # La columna autogenerada (PK implícita) no viene en el CSV: se
+        # antepone una celda vacía a cada fila y se autoasigna al cargar.
+        pad = [""] if auto_pk is not None else []
+        load_rows: list[tuple[int, list[str]]] = [
+            (ln, pad + raw) for ln, raw in rows]
         derive: tuple[int, str] | None = None
         if det is not None:
             lat_i = column_position(header, det["lat_col"])
             lng_i = column_position(header, det["lng_col"])
             load_rows = [
-                (ln, list(raw) + [raw[lat_i] if lat_i < len(raw) else "",
-                                  raw[lng_i] if lng_i < len(raw) else ""])
-                for ln, raw in rows
+                (ln, list(raw) + [
+                    raw[len(pad) + lat_i] if len(pad) + lat_i < len(raw) else "",
+                    raw[len(pad) + lng_i] if len(pad) + lng_i < len(raw) else ""])
+                for ln, raw in load_rows
             ]
             derive = (len(columns) - 1, det["column"])
         stats = self.bulk_load_rows(table, load_rows, derive=derive)
@@ -357,10 +410,12 @@ class Engine:
             if det is not None:
                 point_col = point_cols[0]
         try:
+            auto_names = {c.name for c in columns if c.auto}
             positions, ignored = map_columns(
                 header,
                 [c for c in columns if c is not point_col]
-                if point_col is not None else columns)
+                if point_col is not None else columns,
+                optional=auto_names)
         except ValueError as exc:
             raise SemanticError(str(exc)) from exc
         plan.add("Map Columns",
@@ -457,11 +512,17 @@ class Engine:
         table = ast["table"]
         t = time.perf_counter()
         columns = self._get_columns(table)
-        if len(ast["values"]) != len(columns):
+        values = list(ast["values"])
+        auto_pos = next((i for i, c in enumerate(columns) if c.auto), None)
+        if auto_pos is not None and len(values) == len(columns) - 1:
+            # INSERT sin mencionar la columna autogenerada: se autoasigna.
+            values.insert(auto_pos, None)
+        if len(values) != len(columns):
             raise SemanticError(
                 f"'{table}' tiene {len(columns)} columnas, "
                 f"se recibieron {len(ast['values'])} valores")
-        row = [coerce_value(v, c) for v, c in zip(ast["values"], columns)]
+        row = [None if v is None and c.auto else coerce_value(v, c)
+               for v, c in zip(values, columns)]
         plan.add("Semantic Check", f"tipos válidos para '{table}'", t)
 
         self._insert_row(table, columns, row, plan)
@@ -472,12 +533,19 @@ class Engine:
         """Inserta una fila validada manteniendo heap file e índices.
 
         Verifica la unicidad de la PRIMARY KEY (índice si existe, si no
-        escaneo secuencial) y devuelve el RID asignado.
+        escaneo secuencial). La columna ``auto`` (PK implícita SERIAL)
+        recibe un entero creciente cuando el valor es ``None``; un valor
+        explícito se respeta y adelanta la secuencia. Devuelve el RID.
         """
         pk = self.catalog.primary_key(table)
         if pk is not None:
             t = time.perf_counter()
             pk_pos = [c.name for c in columns].index(pk.name)
+            if pk.auto:
+                if row[pk_pos] is None:
+                    row[pk_pos] = self._next_auto_id(table)
+                else:
+                    self._bump_auto_seq(table, row[pk_pos])
             value = row[pk_pos]
             idx_meta = self.catalog.index_on(table, pk.name, {"BTREE", "HASH"})
             if idx_meta is not None:
@@ -569,7 +637,8 @@ class Engine:
                 raw_row = list(raw_row[:-2])
                 raw_row.insert(point_pos, point)
             try:
-                row = [cast_csv_value(v, c)
+                row = [None if c.auto and v.strip() == ""
+                       else cast_csv_value(v, c)
                        for v, c in zip(raw_row, columns)]
                 self._insert_row(table, columns, row)
             except (ValueError, SerializationError, ExecutionError) as exc:
@@ -578,6 +647,7 @@ class Engine:
                     errors.append({"line": line_no, "reason": str(exc)})
                 continue
             loaded += 1
+        self._flush_seq()
         return {"rows_loaded": loaded, "rows_rejected": rejected,
                 "errors": errors}
 
@@ -874,7 +944,7 @@ class Engine:
                 "name": name,
                 "columns": [
                     {"name": c.name, "type": c.type_str(),
-                     "primary_key": c.primary_key}
+                     "primary_key": c.primary_key, "auto": c.auto}
                     for c in columns
                 ],
                 "indexes": [
