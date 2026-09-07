@@ -74,7 +74,10 @@ CREATE INDEX [nombre] ON tabla (col) USING BTREE|HASH|RTREE;
 
 INSERT INTO t VALUES (v1, v2, ...);          -- un literal POINT se escribe (x, y)
 
-SELECT * | c1, c2 FROM t [WHERE cond] [LIMIT n];
+SELECT * | c1, c2 | COUNT(*), MIN(c), MAX(c), SUM(c), AVG(c) FROM t
+  [WHERE cond] [LIMIT n [OFFSET m]];
+-- los agregados se combinan entre sí (un solo grupo, sin GROUP BY) y no
+--   con columnas sueltas; siempre devuelven 1 fila (COUNT=0, MIN/MAX/SUM/AVG=NULL sin filas)
 -- cond:
 --   col = lit | col < n | col <= n | col > n | col >= n
 --   col BETWEEN a AND b

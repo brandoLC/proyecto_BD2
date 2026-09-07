@@ -12,8 +12,11 @@ Gramática soportada (keywords case-insensitive, ';' final opcional)::
                    USING (BTREE | HASH | RTREE)
     insert      := INSERT INTO ident VALUES '(' value (',' value)* ')'
     value       := ['-'] NUMBER | STRING | TRUE | FALSE | '(' num ',' num ')'
-    select      := SELECT ('*' | ident (',' ident)*) FROM ident
-                   [WHERE cond] [LIMIT num]
+    select      := SELECT ('*' | select_item (',' select_item)*) FROM ident
+                   [WHERE cond] [LIMIT num [OFFSET num]]
+    select_item := '*' | ident | COUNT '(' '*' ')'
+                 | MIN '(' ident ')' | MAX '(' ident ')'
+                 | SUM '(' ident ')' | AVG '(' ident ')'
     cond        := ident op literal                       (op: = < <= > >=)
                  | ident BETWEEN literal AND literal
                  | ident IN '(' point ',' num ')'         (radio espacial)
@@ -34,8 +37,10 @@ KEYWORDS = {
     "CREATE", "TABLE", "PRIMARY", "KEY", "INT", "FLOAT", "VARCHAR", "TEXT",
     "BOOL", "POINT", "INDEX", "ON", "USING", "BTREE", "HASH", "RTREE",
     "INSERT", "INTO", "VALUES", "SELECT", "FROM", "WHERE", "LIMIT",
+    "OFFSET",
     "BETWEEN", "AND", "IN", "KNN", "DELETE", "TRUE", "FALSE",
     "FILE", "LOAD", "DROP",
+    "COUNT", "MIN", "MAX", "SUM", "AVG",
 }
 
 TOKEN_RE = re.compile(
@@ -304,20 +309,22 @@ class Parser:
     # ------------------------------------------------------------------
     # SELECT
     # ------------------------------------------------------------------
+    _AGG_FUNCS = ("COUNT", "MIN", "MAX", "SUM", "AVG")
+
     def _parse_select(self) -> dict:
         self.expect_kw("SELECT")
-        columns: list[str] = []
-        tok = self.peek()
-        if tok.kind == "punct" and tok.value == "*":
+        items = [self._parse_select_item()]
+        while self.peek().kind == "punct" and self.peek().value == ",":
             self.advance()
-            columns = ["*"]
-        else:
-            columns.append(self.expect_ident())
-            while self.peek().kind == "punct" and self.peek().value == ",":
-                self.advance()
-                columns.append(self.expect_ident())
+            items.append(self._parse_select_item())
         self.expect_kw("FROM")
         table = self.expect_ident()
+        # Con agregados la lista es de diccionarios {"agg", "column"};
+        # sin agregados se conserva el formato histórico (["*"] o nombres).
+        if any(it["agg"] is not None for it in items):
+            columns = items
+        else:
+            columns = [it["column"] for it in items]
         where = None
         if self.accept_kw("WHERE"):
             where = self._parse_condition()
@@ -328,8 +335,47 @@ class Parser:
                 raise ParseError("LIMIT requiere un entero no negativo",
                                  self.peek().pos)
             limit = n
+        offset = None
+        if self.accept_kw("OFFSET"):
+            # OFFSET solo es válido acompañando a LIMIT (como en PostgreSQL
+            # con LIMIT explícito; no se soporta la forma OFFSET ... LIMIT).
+            if limit is None:
+                raise ParseError("OFFSET requiere un LIMIT previo",
+                                 self.peek().pos)
+            n = self.expect_number()
+            if not isinstance(n, int) or n < 0:
+                raise ParseError("OFFSET requiere un entero no negativo",
+                                 self.peek().pos)
+            offset = n
         return {"type": "select", "table": table, "columns": columns,
-                "where": where, "limit": limit}
+                "where": where, "limit": limit, "offset": offset}
+
+    def _parse_select_item(self) -> dict:
+        """Un elemento de la lista de selección: ``*``, columna o agregado."""
+        tok = self.peek()
+        if tok.kind == "punct" and tok.value == "*":
+            self.advance()
+            return {"agg": None, "column": "*"}
+        if tok.kind == "kw" and tok.value in self._AGG_FUNCS:
+            fn = self.advance().value.lower()
+            self.expect_punct("(")
+            if fn == "count":
+                arg = self.peek()
+                if not (arg.kind == "punct" and arg.value == "*"):
+                    raise ParseError("COUNT solo soporta COUNT(*)", arg.pos)
+                self.advance()
+                column = None
+            else:
+                column = self.expect_ident()
+            self.expect_punct(")")
+            return {"agg": fn, "column": column}
+        if tok.kind == "word":
+            nxt = self.tokens[self.i + 1]
+            if nxt.kind == "punct" and nxt.value == "(":
+                raise ParseError(f"función desconocida '{tok.value}'", tok.pos)
+            return {"agg": None, "column": self.advance().value.lower()}
+        raise ParseError("se esperaba '*', una columna o una función de "
+                         f"agregación, se encontró {tok.value!r}", tok.pos)
 
     def _parse_condition(self) -> dict:
         column = self.expect_ident()

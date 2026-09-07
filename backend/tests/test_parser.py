@@ -38,6 +38,13 @@ class TestAceptacion:
         assert ast["where"] == {"kind": "compare", "column": "id",
                                 "op": "=", "value": 5}
         assert ast["limit"] == 3
+        assert ast["offset"] is None  # OFFSET es opcional
+
+    def test_select_limit_offset(self):
+        ast = parse("SELECT * FROM t LIMIT 10 OFFSET 20;")
+        assert ast["limit"] == 10 and ast["offset"] == 20
+        ast = parse("SELECT * FROM t LIMIT 7 OFFSET 0")
+        assert ast["limit"] == 7 and ast["offset"] == 0
 
     def test_select_operadores(self):
         for op in ("=", "<", "<=", ">", ">="):
@@ -84,6 +91,10 @@ class TestRechazo:
         "INSERT INTO t VALUES",
         "DELETE FROM t",
         "SELECT * FROM t WHERE p KNN ((1,2), 0)",
+        "SELECT * FROM t OFFSET 10",          # OFFSET sin LIMIT
+        "SELECT * FROM t LIMIT 5 OFFSET",     # OFFSET sin entero
+        "SELECT * FROM t LIMIT 5 OFFSET -1",  # OFFSET negativo
+        "SELECT * FROM t LIMIT 5 OFFSET 2.5",
         "CREATE TABLE t (a VARCHAR)",
         "SELECT * FROM t WHERE a = 1 extra",
         "DROP TABLE",

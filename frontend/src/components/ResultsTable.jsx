@@ -1,9 +1,14 @@
+// Tamaño de página del pager: coincide con SELECT_ROW_CAP del backend, así
+// la primera página (consulta sin LIMIT) y las siguientes (LIMIT/OFFSET
+// transparente) traen la misma cantidad de filas.
+export const PAGE_SIZE = 100
+
 // Pestaña Resultados: tabla de datos o mensaje de éxito para no-SELECT.
 // Incluye exportación a CSV y celdas truncadas con vista completa al clic.
 import { useState } from 'react'
 
 function formatCell(cell) {
-  if (cell === null || cell === undefined) return 'NULL'
+  if (cell === null || cell === undefined) return '' // NULL se renderiza vacío
   if (typeof cell === 'object') return JSON.stringify(cell)
   return String(cell)
 }
@@ -19,7 +24,7 @@ function toCsv(columns, rows) {
   return lines.join('\n')
 }
 
-export default function ResultsTable({ result, tableName }) {
+export default function ResultsTable({ result, tableName, page = 0, pagerActive = false, pagerLoading = false, onPageChange }) {
   const [cellView, setCellView] = useState(null) // {column, value} del modal
 
   if (!result) {
@@ -150,6 +155,37 @@ export default function ResultsTable({ result, tableName }) {
           </tbody>
         </table>
       </div>
+
+      {pagerActive && (
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <p className="font-mono text-xs text-helper">
+            Página {page + 1} · mostrando {PAGE_SIZE} filas por página
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onPageChange?.(page - 1)}
+              disabled={page === 0 || pagerLoading}
+              className="inline-flex items-center gap-1 rounded-full border border-hairline px-3 py-1 text-xs text-ink transition-colors hover:bg-canvas disabled:opacity-50"
+            >
+              ◀ Anterior
+            </button>
+            <button
+              type="button"
+              onClick={() => onPageChange?.(page + 1)}
+              // Última página: devolvió menos filas que el tamaño de página.
+              // El pager se muestra según la página 0 (consulta original
+              // truncada), no según el truncated de la página actual, cuya
+              // consulta lleva LIMIT explícito y nunca viene truncada.
+              disabled={rows.length < PAGE_SIZE || pagerLoading}
+              title={`Mostrar las siguientes ${PAGE_SIZE} filas`}
+              className="inline-flex items-center gap-1 rounded-full border border-hairline px-3 py-1 text-xs text-ink transition-colors hover:bg-canvas disabled:opacity-50"
+            >
+              Siguiente ▶
+            </button>
+          </div>
+        </div>
+      )}
 
       {cellView && (
         <div

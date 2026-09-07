@@ -21,8 +21,10 @@ from ..storage.heap_file import HeapFile
 from ..storage.record import (
     Column,
     SerializationError,
+    TYPE_FLOAT,
     TYPE_INT,
     TYPE_POINT,
+    TYPE_VARCHAR,
     coerce_value,
     decode_key,
     deserialize_row,
@@ -64,6 +66,15 @@ INDEX_EXT = {"BTREE": "btree", "HASH": "hash", "RTREE": "rtree"}
 # en carga masiva siembra un conjunto con las claves existentes en vez de
 # consultar el índice fila por fila (equivalente y mucho más rápido).
 _BULK_PK_SET_MIN = 512
+
+# Tope de seguridad anti-congelamiento del cliente: un SELECT sin LIMIT
+# explícito devuelve como máximo estas filas y marca la respuesta con
+# ``"truncated": true`` para que el cliente pagine. Un LIMIT explícito del
+# usuario (aunque sea mayor que este tope) siempre se respeta completo y no
+# marca truncated. El escaneo se detiene apenas supera este conteo (sondea
+# una fila extra para saber si el total lo excede) en lugar de materializar
+# y serializar millones de filas.
+SELECT_ROW_CAP = 100
 
 
 def _ms(t0: float) -> float:
@@ -747,6 +758,8 @@ class Engine:
     # SELECT
     # ------------------------------------------------------------------
     def _exec_select(self, ast: dict, plan: _Plan) -> dict:
+        if any(isinstance(c, dict) for c in ast["columns"]):
+            return self._exec_aggregate_select(ast, plan)
         table = ast["table"]
         t = time.perf_counter()
         columns = self._get_columns(table)
@@ -773,10 +786,21 @@ class Engine:
         t = time.perf_counter()
         heap = self._open_heap(table)
         limit = ast["limit"]
+        offset = ast["offset"] or 0
+        # Semántica SQL estándar: saltar las primeras `offset` filas del
+        # resultado y luego aplicar el límite. Con LIMIT explícito el
+        # escaneo junta offset+limit filas que cumplen (pushdown); sin
+        # LIMIT explícito aplica el tope SELECT_ROW_CAP y sondea una fila
+        # extra para saber si el resultado total lo supera (truncated).
+        if limit is not None:
+            stop_at = offset + limit
+        else:
+            stop_at = SELECT_ROW_CAP + 1  # +1: sondeo para detectar truncated
+        truncated = False
         if rids is None:  # escaneo secuencial
             # El LIMIT se empuja al escaneo: se detiene apenas junta las
             # filas pedidas (salvo KNN por fuerza bruta, que necesita todas).
-            early_stop = limit is not None and not (
+            early_stop = not (
                 where is not None and where["kind"] == "knn")
             rows = []
             for rid, raw in heap.scan():
@@ -784,8 +808,9 @@ class Engine:
                 if where is not None and not self._match(columns, where, row):
                     continue
                 rows.append((rid, row))
-                if early_stop and len(rows) >= limit:
+                if early_stop and len(rows) >= stop_at:
                     break
+            fetched = len(rows)  # registros leídos antes de la ventana
             if where is not None and where["kind"] == "knn":
                 # KNN por fuerza bruta cuando no hay R-Tree
                 pos = [c.name for c in columns].index(where["column"])
@@ -793,28 +818,49 @@ class Engine:
                 rows.sort(key=lambda t: math.hypot(t[1][pos][0] - cx,
                                                    t[1][pos][1] - cy))
                 rows = rows[: where["k"]]
+            # OFFSET/LIMIT (o el tope de seguridad) sobre el resultado.
+            if limit is not None:
+                rows = rows[offset:offset + limit]
+            else:
+                truncated = len(rows) > SELECT_ROW_CAP
+                rows = rows[:SELECT_ROW_CAP]
         elif ordered_knn is not None:
             by_rid = dict()
             for rid, d in ordered_knn:
                 by_rid[rid] = deserialize_row(columns, heap.read(rid))
             rows = [(rid, by_rid[rid]) for rid, _ in ordered_knn]
+            fetched = len(rows)
+            # offset/limit se aplica sobre out_rows tras la proyección.
         else:
-            if limit is not None and ordered_knn is None:
-                rids = rids[:limit]  # pushdown: los RIDs ya cumplen el WHERE
+            if limit is not None:
+                # pushdown: los RIDs ya cumplen el WHERE
+                rids = rids[offset:offset + limit]
+            else:
+                truncated = len(rids) > SELECT_ROW_CAP
+                rids = rids[:SELECT_ROW_CAP]
+            fetched = len(rids)
             rows = [(rid, deserialize_row(columns, heap.read(rid)))
                     for rid in rids]
         heap.close()
-        plan.add("Fetch Rows", f"{len(rows)} registros leídos del heap", t)
+        plan.add("Fetch Rows", f"{fetched} registros leídos del heap", t)
 
         t = time.perf_counter()
         positions = [[c.name for c in columns].index(name) for name in selected]
         out_rows = [[row[i] for i in positions] for _, row in rows]
-        if ast["limit"] is not None and ordered_knn is None:
-            out_rows = out_rows[: ast["limit"]]
+        if ordered_knn is not None:
+            # KNN por R-Tree: offset/limit sobre el resultado ordenado.
+            if limit is not None:
+                out_rows = out_rows[offset:offset + limit]
+            elif len(out_rows) > SELECT_ROW_CAP:
+                out_rows = out_rows[:SELECT_ROW_CAP]
+                truncated = True
         plan.add("Projection", f"columnas: {', '.join(selected)}", t)
-        if ast["limit"] is not None:
+        if limit is not None:
             t = time.perf_counter()
-            plan.add("Limit", f"máximo {ast['limit']} filas", t)
+            detail = f"máximo {limit} filas"
+            if offset:
+                detail += f", salta {offset}"
+            plan.add("Limit", detail, t)
 
         spatial = self._spatial_payload(columns, selected, out_rows)
         return {
@@ -825,7 +871,144 @@ class Engine:
             "rowcount": len(out_rows),
             "message": "OK",
             "spatial": spatial,
+            "truncated": truncated,
         }
+
+    # ------------------------------------------------------------------
+    # SELECT con agregación (un solo grupo, sin GROUP BY)
+    # ------------------------------------------------------------------
+    # Tipos soportados por cada función de agregación.
+    _AGG_TYPES = {
+        "min": {TYPE_INT, TYPE_FLOAT, TYPE_VARCHAR},
+        "max": {TYPE_INT, TYPE_FLOAT, TYPE_VARCHAR},
+        "sum": {TYPE_INT, TYPE_FLOAT},
+        "avg": {TYPE_INT, TYPE_FLOAT},
+    }
+
+    def _exec_aggregate_select(self, ast: dict, plan: _Plan) -> dict:
+        """Ejecuta SELECT con COUNT/MIN/MAX/SUM/AVG sobre un único grupo.
+
+        El resultado es siempre una fila con tantas columnas como
+        expresiones de agregación (``count``, ``min_lat``, ...). No se
+        aplican LIMIT/OFFSET ni el tope SELECT_ROW_CAP: el agregado se
+        calcula sobre todas las filas que cumplen el WHERE en un solo
+        pase con acumuladores. Con cero filas coincidentes COUNT
+        devuelve 0 y MIN/MAX/SUM/AVG devuelven None.
+        """
+        table = ast["table"]
+        t = time.perf_counter()
+        columns = self._get_columns(table)
+        col_map = {c.name: c for c in columns}
+        aggs: list[dict] = []
+        for item in ast["columns"]:
+            if item["agg"] is None:
+                raise SemanticError(
+                    "no se pueden mezclar columnas con agregados")
+            fn = item["agg"]
+            if fn == "count":
+                aggs.append({"fn": fn, "column": None, "pos": None})
+                continue
+            col = col_map.get(item["column"])
+            if col is None:
+                raise SemanticError(
+                    f"la columna '{item['column']}' no existe en '{table}'")
+            if col.type not in self._AGG_TYPES[fn]:
+                raise SemanticError(
+                    f"{fn.upper()} no soporta el tipo {col.type_str()}")
+            aggs.append({"fn": fn, "column": col.name,
+                         "pos": [c.name for c in columns].index(col.name)})
+        where = ast["where"]
+        if where is not None:
+            self._get_column(table, where["column"])
+        detail = ", ".join(
+            f"{a['fn']}(*)" if a["fn"] == "count"
+            else f"{a['fn']}({a['column']})" for a in aggs)
+        plan.add("Semantic Check",
+                 f"agregados válidos sobre '{table}': {detail}", t)
+
+        # Mismo método de acceso que un SELECT normal: índice si existe.
+        rids: list[RID] | None = None
+        ordered_knn: list[tuple[RID, float]] | None = None
+        if where is not None:
+            rids, ordered_knn = self._plan_access(table, where, plan)
+
+        t = time.perf_counter()
+        heap = self._open_heap(table)
+        # COUNT(*) sin WHERE no necesita deserializar: cuenta registros
+        # crudos del scan (con WHERE el _match ya exige deserializar).
+        needs_values = any(a["fn"] != "count" for a in aggs)
+        acc = [{"total": 0, "n": 0, "best": None, "seen": False}
+               for _ in aggs]
+        count = 0
+        fetched = 0
+        if rids is not None:  # acceso por índice (incl. KNN por R-Tree)
+            fetched = len(rids)
+            if needs_values:
+                for rid in rids:
+                    row = deserialize_row(columns, heap.read(rid))
+                    count += 1
+                    self._accumulate(aggs, acc, row)
+            else:
+                count = len(rids)
+        else:  # escaneo secuencial
+            for rid, raw in heap.scan():
+                fetched += 1
+                if where is not None:
+                    row = deserialize_row(columns, raw)
+                    if not self._match(columns, where, row):
+                        continue
+                elif needs_values:
+                    row = deserialize_row(columns, raw)
+                else:
+                    row = None
+                count += 1
+                if row is not None:
+                    self._accumulate(aggs, acc, row)
+        heap.close()
+        plan.add("Fetch Rows", f"{fetched} registros leídos del heap", t)
+
+        t = time.perf_counter()
+        out_cols: list[str] = []
+        out_row: list = []
+        for a, st in zip(aggs, acc):
+            if a["fn"] == "count":
+                out_cols.append("count")
+                out_row.append(count)
+            else:
+                out_cols.append(f"{a['fn']}_{a['column']}")
+                out_row.append(self._agg_result(a, st))
+        plan.add("Aggregate", detail, t)
+        return {"kind": "select", "columns": out_cols, "rows": [out_row],
+                "rowcount": 1, "message": "OK", "spatial": None,
+                "truncated": False}
+
+    @staticmethod
+    def _accumulate(aggs: list[dict], acc: list[dict], row: list) -> None:
+        """Actualiza los acumuladores con una fila (un solo pase)."""
+        for a, st in zip(aggs, acc):
+            if a["fn"] == "count":
+                continue
+            v = row[a["pos"]]
+            if a["fn"] == "min":
+                if not st["seen"] or v < st["best"]:
+                    st["best"] = v
+            elif a["fn"] == "max":
+                if not st["seen"] or v > st["best"]:
+                    st["best"] = v
+            else:  # sum / avg
+                st["total"] += v
+                st["n"] += 1
+            st["seen"] = True
+
+    @staticmethod
+    def _agg_result(a: dict, st: dict):
+        if a["fn"] == "min" or a["fn"] == "max":
+            return st["best"] if st["seen"] else None
+        if not st["seen"]:  # cero filas: sum/avg son NULL
+            return None
+        if a["fn"] == "sum":
+            return st["total"]
+        return st["total"] / st["n"]  # avg: siempre float
 
     def _plan_access(self, table: str, where: dict,
                      plan: _Plan) -> tuple[list[RID] | None,

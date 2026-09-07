@@ -5,7 +5,7 @@ import TopNav from './components/TopNav.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import SqlEditor from './components/SqlEditor.jsx'
 import StatusMessage from './components/StatusMessage.jsx'
-import ResultsTable from './components/ResultsTable.jsx'
+import ResultsTable, { PAGE_SIZE } from './components/ResultsTable.jsx'
 import PlanPanel from './components/PlanPanel.jsx'
 import MapPanel from './components/MapPanel.jsx'
 import InferSchemaModal from './components/InferSchemaModal.jsx'
@@ -66,6 +66,13 @@ export default function App() {
   const [sql, setSql] = useState('')
   const [executing, setExecuting] = useState(false)
   const [result, setResult] = useState(null) // última respuesta ok:true
+  const [page, setPage] = useState(0) // página actual del pager (0-based)
+  const [pagerLoading, setPagerLoading] = useState(false)
+  // Pager persistente: se activa si la página 0 (consulta original, sin
+  // LIMIT propio) vino truncada y se mantiene en las páginas siguientes
+  // aunque esas respuestas (con LIMIT explícito) reporten truncated:false.
+  // Cualquier consulta nueva desde el editor lo vuelve a calcular.
+  const [pagerActive, setPagerActive] = useState(false)
   const [queryError, setQueryError] = useState(null) // {error, stage} de ok:false
   const [lastSql, setLastSql] = useState('') // SQL que produjo `result`
   const [lastTable, setLastTable] = useState(null) // tabla de la consulta que produjo `result`
@@ -118,62 +125,102 @@ export default function App() {
     return () => clearInterval(interval)
   }, [checkHealth, loadTables])
 
+  // Ejecuta `query` en la página `pageNum` del pager (0-based). La página 0
+  // corre la consulta tal cual; N > 0 le agrega "LIMIT PAGE_SIZE OFFSET
+  // N*PAGE_SIZE" de forma transparente (pgAdmin): solo se usa cuando la
+  // respuesta de la página 0 vino truncada, o sea que la consulta original
+  // no traía LIMIT propio. El SQL del editor nunca se toca.
+  const runQuery = useCallback(
+    async (query, pageNum, recordHistory) => {
+      if (!query) return
+      const effective =
+        pageNum > 0
+          ? `${query} LIMIT ${PAGE_SIZE} OFFSET ${pageNum * PAGE_SIZE}`
+          : query
+      setExecuting(true)
+      if (pageNum > 0) setPagerLoading(true)
+      setQueryError(null)
+      try {
+        const data = await postQuery(effective)
+        if (data.ok) {
+          setResult(data)
+          setPage(pageNum)
+          if (pageNum === 0) {
+            // La decisión de mostrar el pager sale de la consulta original.
+            setPagerActive(Boolean(data.truncated))
+          }
+          if (recordHistory) {
+            setLastSql(query)
+            const name = extractTableName(query)
+            setLastTable(name)
+            // Historial: sin duplicados consecutivos, tope HISTORY_MAX.
+            setHistory((prev) => {
+              const next = (prev[0] === query ? prev : [query, ...prev]).slice(0, HISTORY_MAX)
+              localStorage.setItem(HISTORY_KEY, JSON.stringify(next))
+              return next
+            })
+            // Breadcrumb: la tabla de la consulta pasa a ser la activa;
+            // si se eliminó la tabla activa, se vuelve a `minidb`.
+            if (data.kind === 'drop_table') {
+              setActiveTable((prev) => (prev === data.table ? null : prev))
+            } else if (name) {
+              setActiveTable(name)
+            }
+            // Refrescar metadatos si el esquema pudo cambiar.
+            if (['create_table', 'create_index', 'insert', 'delete', 'drop_table'].includes(data.kind)) {
+              loadTables()
+            }
+            // Una tabla recreada/eliminada invalida el mensaje de carga CSV anterior.
+            if ((data.kind === 'create_table' || data.kind === 'drop_table') && data.table) {
+              setCsvUploads((prev) => {
+                const next = { ...prev }
+                delete next[data.table]
+                return next
+              })
+            }
+            // El mapeo de POINT derivado solo se invalida al ELIMINAR la tabla;
+            // al crearla se necesita intacto para el "Cargar CSV" que sigue.
+            if (data.kind === 'drop_table' && data.table) {
+              setDerivedPoints((prev) => {
+                if (!(data.table in prev)) return prev
+                const next = { ...prev }
+                delete next[data.table]
+                return next
+              })
+            }
+          }
+        } else {
+          setQueryError({ error: data.error || 'Error desconocido', stage: data.stage })
+        }
+      } catch (e) {
+        setQueryError({ error: `Error de red: ${e.message}`, stage: null })
+      } finally {
+        setExecuting(false)
+        setPagerLoading(false)
+      }
+    },
+    [loadTables],
+  )
+
   const execute = useCallback(async () => {
     const query = sql.trim()
     if (!query || executing) return
-    setExecuting(true)
-    setQueryError(null)
-    try {
-      const data = await postQuery(query)
-      if (data.ok) {
-        setResult(data)
-        setLastSql(query)
-        const name = extractTableName(query)
-        setLastTable(name)
-        // Historial: sin duplicados consecutivos, tope HISTORY_MAX.
-        setHistory((prev) => {
-          const next = (prev[0] === query ? prev : [query, ...prev]).slice(0, HISTORY_MAX)
-          localStorage.setItem(HISTORY_KEY, JSON.stringify(next))
-          return next
-        })
-        // Breadcrumb: la tabla de la consulta pasa a ser la activa;
-        // si se eliminó la tabla activa, se vuelve a `minidb`.
-        if (data.kind === 'drop_table') {
-          setActiveTable((prev) => (prev === data.table ? null : prev))
-        } else if (name) {
-          setActiveTable(name)
-        }
-        // Refrescar metadatos si el esquema pudo cambiar.
-        if (['create_table', 'create_index', 'insert', 'delete', 'drop_table'].includes(data.kind)) {
-          loadTables()
-        }
-        // Una tabla recreada/eliminada invalida el mensaje de carga CSV anterior.
-        if ((data.kind === 'create_table' || data.kind === 'drop_table') && data.table) {
-          setCsvUploads((prev) => {
-            const next = { ...prev }
-            delete next[data.table]
-            return next
-          })
-        }
-        // El mapeo de POINT derivado solo se invalida al ELIMINAR la tabla;
-        // al crearla se necesita intacto para el "Cargar CSV" que sigue.
-        if (data.kind === 'drop_table' && data.table) {
-          setDerivedPoints((prev) => {
-            if (!(data.table in prev)) return prev
-            const next = { ...prev }
-            delete next[data.table]
-            return next
-          })
-        }
-      } else {
-        setQueryError({ error: data.error || 'Error desconocido', stage: data.stage })
-      }
-    } catch (e) {
-      setQueryError({ error: `Error de red: ${e.message}`, stage: null })
-    } finally {
-      setExecuting(false)
-    }
-  }, [sql, executing, loadTables])
+    // Consulta nueva desde el editor: la paginación vuelve a la página 0
+    // y el pager se recalcula con la respuesta (setPagerActive en runQuery).
+    setPage(0)
+    setPagerActive(false)
+    await runQuery(query, 0, true)
+  }, [sql, executing, runQuery])
+
+  // Cambio de página del pager: pagina la última consulta ejecutada (la
+  // original, sin LIMIT propio porque vino truncada).
+  const changePage = useCallback(
+    (newPage) => {
+      if (!lastSql || newPage < 0) return
+      runQuery(lastSql, newPage, false)
+    },
+    [lastSql, runQuery],
+  )
 
   const clearAll = useCallback(() => {
     setSql('')
@@ -181,6 +228,8 @@ export default function App() {
     setQueryError(null)
     setLastSql('')
     setLastTable(null)
+    setPage(0)
+    setPagerActive(false)
   }, [])
 
   const selectTable = useCallback(
@@ -358,7 +407,16 @@ export default function App() {
                 ))}
               </div>
 
-              {tab === 'Resultados' && <ResultsTable result={result} tableName={lastTable} />}
+              {tab === 'Resultados' && (
+                <ResultsTable
+                  result={result}
+                  tableName={lastTable}
+                  page={page}
+                  pagerActive={pagerActive && sql.trim() === lastSql}
+                  pagerLoading={pagerLoading}
+                  onPageChange={changePage}
+                />
+              )}
               {tab === 'Plan' && <PlanPanel result={result} />}
               {tab === 'Mapa' && <MapPanel result={result} sql={lastSql} theme={theme} />}
             </section>
