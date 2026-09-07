@@ -202,6 +202,58 @@ antes de la optimización. Los flags `defer_header`/`defer_flush` son
 opcionales y por defecto desactivados: las rutas normales (INSERT,
 SELECT, DELETE) conservan su persistencia inmediata.
 
+## Rendimiento y optimizaciones
+
+Mediciones reales (contenedor Docker, dataset sintético de 100k filas y
+Uber TLC de 1M filas). Todas reproducibles con los comandos de la
+[Sesión de ejemplo](#sesión-de-ejemplo) y `CREATE TABLE ... FROM FILE`.
+
+### Carga masiva CSV (~75×)
+
+| Filas | Antes | Después | Velocidad |
+|---|---|---|---|
+| 100k | 68.4 s | 0.92 s | ~110k filas/s (curva lineal) |
+
+El cuello de botella era persistir a disco por fila (catálogo, páginas del
+heap y nodos del B+ Tree). La carga masiva ahora usa un buffer pool
+write-back para el heap, una caché write-through de nodos y volcado
+diferido en el B+ Tree / Hash / R-Tree, con verificación de unicidad de PK
+en memoria. Es opt-in: los `INSERT` normales conservan persistencia
+inmediata.
+
+### Pushdown de LIMIT (~5,400×)
+
+`SELECT * FROM uber_1m LIMIT 100`: 4,831 ms → 0.89 ms. El `LIMIT` se
+empuja al escaneo (se detiene al juntar las filas pedidas, como el nodo
+`Limit` del modelo volcán de PostgreSQL) y recorta los RIDs en el acceso
+por índice. Un `SELECT` sin `LIMIT` sigue siendo full scan legítimo.
+
+### R-Tree: de "no termina" a minutos
+
+`CREATE INDEX ... USING RTREE` sobre 1M de filas pasó de no completarse
+(horas proyectadas) a ~4.3 min, y el KNN sobre 1M responde en ~1.4 ms.
+Tres problemas encadenados, encontrados por perfilado:
+
+1. **I/O redundante**: cada inserción re-leía y re-escribía (con flush)
+   todos los nodos del camino raíz→hoja → caché de nodos + volcado
+   diferido.
+2. **Split cuadrático ~O(M³)**: la distribución de entradas recomputaba
+   los MBR de ambos grupos desde cero por cada candidata (0.38 s por
+   split). Con MBR/áreas actualizados incrementalmente y aritmética
+   in-line: ~1 ms por split. **Este era el costo dominante.**
+3. **Volcado masivo al evictar la caché**: se reescribían hasta 4,096
+   páginas cada pocas inserciones; las re-lecturas ahora sirven los
+   nodos pendientes desde memoria.
+
+### Lección: las constantes ocultas
+
+El algoritmo era asintóticamente correcto (O(n log n)) antes y después;
+lo que cambió fue la constante (~45× en inserciones, ~400× en splits).
+Con 1k–10k filas el impuesto por fila (ms) es imperceptible; en 100k+
+se acumula hasta parecer un colgado. Datos reales (Uber, geográficamente
+agrupado) generan más splits que datos uniformes: ~2× más lento que la
+proyección teórica — la distribución de los datos importa.
+
 ## Ejecutar localmente
 
 ```bash
