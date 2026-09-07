@@ -58,6 +58,14 @@ def mbr_enlargement(m: MBR, p: Point) -> float:
     return mbr_area(mbr_union(m, mbr_of_point(p))) - mbr_area(m)
 
 
+def mbr_of_entries(entries) -> MBR:
+    """MBR que cubre todos los MBR de una lista de entradas."""
+    m = entries[0][0]
+    for e in entries[1:]:
+        m = mbr_union(m, e[0])
+    return m
+
+
 def dist(a: Point, b: Point) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
@@ -89,6 +97,21 @@ class RTree:
         # una sola vez al final (``flush_header``/``close``).
         self.defer_header = False
         self._header_dirty = False
+        # Caché write-through de nodos decodificados (página -> nodo):
+        # evita re-leer y re-decodificar todo el camino de raíz a hoja en
+        # cada inserción. Todas las mutaciones pasan por ``_store_node``,
+        # que actualiza la caché junto con el disco, así que nunca queda
+        # desincronizada. Con tope: al llenarse se vacía completa.
+        self._cache: dict[int, _Node] = {}
+        self._cache_max = 1024
+        # Buffer pool para carga masiva: con ``defer_flush`` los nodos
+        # modificados se mantienen en memoria (pendientes de serializar)
+        # y se escriben una sola vez al final (``flush_pages``/``close``),
+        # en vez de re-serializar y reescribir la página (con flush) en
+        # cada inserción. Con tope: al llenarse se vuelca y se vacía.
+        self.defer_flush = False
+        self._pending: dict[int, _Node] = {}
+        self._pending_max = 4096
         if create or not os.path.exists(path):
             self.max_entries = max_entries or default_m
             if self.max_entries < 2:
@@ -142,9 +165,43 @@ class RTree:
         self.page_count += 1
         return page_id
 
-    def _load_node(self, page_id: int) -> _Node:
+    def _read_raw(self, page_id: int) -> bytes:
+        node = self._pending.get(page_id)
+        if node is not None:
+            # página aún no volcada: se serializa al vuelo (raro: solo si
+            # la caché de nodos se vació antes del volcado)
+            return self._serialize_node(node)
         self._file.seek(page_id * PAGE_SIZE)
-        data = self._file.read(PAGE_SIZE)
+        return self._file.read(PAGE_SIZE)
+
+    def _write_raw(self, page_id: int, data: bytes) -> None:
+        self._file.seek(page_id * PAGE_SIZE)
+        self._file.write(data)
+        self._file.flush()
+
+    def flush_pages(self) -> None:
+        """Serializa y vuelca los nodos pendientes (carga masiva)."""
+        if not self._pending:
+            return
+        for page_id in sorted(self._pending):
+            self._file.seek(page_id * PAGE_SIZE)
+            self._file.write(self._serialize_node(self._pending[page_id]))
+        self._file.flush()
+        self._pending.clear()
+
+    def _load_node(self, page_id: int) -> _Node:
+        node = self._cache.get(page_id)
+        if node is not None:
+            return node
+        if len(self._cache) >= self._cache_max:
+            # Al perder la caché no hace falta volcar: ``_read_raw``
+            # consulta primero ``_pending`` y serializa al vuelo, así que
+            # las re-lecturas siguen viendo el último estado en memoria.
+            # (Volcar aquí reescribía miles de páginas cada pocas
+            # inserciones y era el segundo cuello de botella en carga
+            # masiva.)
+            self._cache.clear()
+        data = self._read_raw(page_id)
         is_leaf, _, count = struct.unpack_from(NODE_HEADER_FMT, data, 0)
         node = _Node(bool(is_leaf))
         pos = NODE_HEADER_SIZE
@@ -159,9 +216,10 @@ class RTree:
                 )
                 node.entries.append(((x1, y1, x2, y2), child))
                 pos += INTERNAL_ENTRY_SIZE
+        self._cache[page_id] = node
         return node
 
-    def _store_node(self, page_id: int, node: _Node) -> None:
+    def _serialize_node(self, node: _Node) -> bytes:
         buf = bytearray(PAGE_SIZE)
         struct.pack_into(
             NODE_HEADER_FMT, buf, 0, 1 if node.is_leaf else 0, 0, len(node.entries)
@@ -174,9 +232,20 @@ class RTree:
             else:
                 struct.pack_into(INTERNAL_ENTRY_FMT, buf, pos, *mbr, ref)
                 pos += INTERNAL_ENTRY_SIZE
-        self._file.seek(page_id * PAGE_SIZE)
-        self._file.write(bytes(buf))
-        self._file.flush()
+        return bytes(buf)
+
+    def _store_node(self, page_id: int, node: _Node) -> None:
+        if len(self._cache) >= self._cache_max:
+            # Igual que en _load_node: sin volcado al evictar (pendientes
+            # siguen visibles vía _read_raw).
+            self._cache.clear()
+        self._cache[page_id] = node
+        if self.defer_flush:
+            if len(self._pending) >= self._pending_max:
+                self.flush_pages()
+            self._pending[page_id] = node
+            return
+        self._write_raw(page_id, self._serialize_node(node))
 
     # ------------------------------------------------------------------
     # Inserción con split cuadrático
@@ -230,60 +299,84 @@ class RTree:
         return mbr
 
     def _quadratic_split(self, node: _Node) -> tuple[_Node, _Node]:
-        """Split cuadrático de Guttman sobre las entradas del nodo."""
+        """Split cuadrático de Guttman sobre las entradas del nodo.
+
+        La aritmética de MBR va in-line y los MBR/áreas de cada grupo se
+        actualizan incrementalmente: elegir cada entrada es un barrido O(M)
+        con constante pequeña (la versión con llamadas por entrada era
+        ~O(M²) por entrada y dominaba el costo de inserción).
+        """
         entries = list(node.entries)
+        n = len(entries)
         # 1) pick seeds: par con mayor espacio desperdiciado
         worst, seeds = -1.0, (0, 1)
-        for i in range(len(entries)):
-            for j in range(i + 1, len(entries)):
-                waste = (
-                    mbr_area(mbr_union(entries[i][0], entries[j][0]))
-                    - mbr_area(entries[i][0])
-                    - mbr_area(entries[j][0])
-                )
-                if waste > worst:
-                    worst, seeds = waste, (i, j)
+        for i in range(n):
+            ix1, iy1, ix2, iy2 = entries[i][0]
+            ia = (ix2 - ix1) * (iy2 - iy1)
+            for j in range(i + 1, n):
+                jx1, jy1, jx2, jy2 = entries[j][0]
+                w = ((jx2 if jx2 > ix2 else ix2) - (jx1 if jx1 < ix1 else ix1)) * \
+                    ((jy2 if jy2 > iy2 else iy2) - (jy1 if jy1 < iy1 else iy1)) \
+                    - ia - (jx2 - jx1) * (jy2 - jy1)
+                if w > worst:
+                    worst, seeds = w, (i, j)
         left = _Node(node.is_leaf)
         right = _Node(node.is_leaf)
         left.entries.append(entries[seeds[0]])
         right.entries.append(entries[seeds[1]])
         rest = [e for k, e in enumerate(entries) if k not in seeds]
         # 2) distribuir el resto
+        lx1, ly1, lx2, ly2 = mbr_of_entries(left.entries)
+        rx1, ry1, rx2, ry2 = mbr_of_entries(right.entries)
+        la = (lx2 - lx1) * (ly2 - ly1)
+        ra = (rx2 - rx1) * (ry2 - ry1)
+        min_fill = self.max_entries // 2 + 1
         while rest:
-            if len(left.entries) + len(rest) == self.max_entries // 2 + 1:
+            if len(left.entries) + len(rest) == min_fill:
                 left.entries.extend(rest)
                 break
-            if len(right.entries) + len(rest) == self.max_entries // 2 + 1:
+            if len(right.entries) + len(rest) == min_fill:
                 right.entries.extend(rest)
                 break
             # pick next: entrada con mayor diferencia de ampliación
-            def mbr_of(group):
-                m = group.entries[0][0]
-                for x in group.entries[1:]:
-                    m = mbr_union(m, x[0])
-                return m
-
-            def prefs(e):
-                """Ampliación de área de agregar ``e`` a cada grupo."""
-                lm, rm = mbr_of(left), mbr_of(right)
-                if node.is_leaf:
-                    p = (e[0][0], e[0][1])
-                    return mbr_enlargement(lm, p), mbr_enlargement(rm, p)
-                dl = mbr_area(mbr_union(lm, e[0])) - mbr_area(lm)
-                dr = mbr_area(mbr_union(rm, e[0])) - mbr_area(rm)
-                return dl, dr
-
-            chosen = max(rest, key=lambda e: abs(prefs(e)[0] - prefs(e)[1]))
-            rest.remove(chosen)
-            dl, dr = prefs(chosen)
-            if dl < dr:
+            best_i, best_diff = 0, -1.0
+            best_dl = best_dr = 0.0
+            for i, e in enumerate(rest):
+                ex1, ey1, ex2, ey2 = e[0]
+                ual = ((lx2 if lx2 > ex2 else ex2) - (lx1 if lx1 < ex1 else ex1)) * \
+                      ((ly2 if ly2 > ey2 else ey2) - (ly1 if ly1 < ey1 else ey1))
+                uar = ((rx2 if rx2 > ex2 else ex2) - (rx1 if rx1 < ex1 else ex1)) * \
+                      ((ry2 if ry2 > ey2 else ey2) - (ry1 if ry1 < ey1 else ey1))
+                dl = ual - la
+                dr = uar - ra
+                d = dl - dr if dl >= dr else dr - dl
+                if d > best_diff:
+                    best_diff, best_i = d, i
+                    best_dl, best_dr = dl, dr
+            chosen = rest.pop(best_i)          # entrada completa (mbr, ref)
+            ex1, ey1, ex2, ey2 = chosen[0]
+            if best_dl < best_dr:
                 left.entries.append(chosen)
-            elif dr < dl:
+                side = left
+            elif best_dr < best_dl:
                 right.entries.append(chosen)
+                side = right
             else:
                 # empate: menor área, luego menor cantidad
-                smaller = left if len(left.entries) <= len(right.entries) else right
-                smaller.entries.append(chosen)
+                side = left if len(left.entries) <= len(right.entries) else right
+                side.entries.append(chosen)
+            # actualizar MBR y área del grupo elegido
+            gx1, gy1, gx2, gy2, ga = (lx1, ly1, lx2, ly2, la) if side is left \
+                else (rx1, ry1, rx2, ry2, ra)
+            gx1 = gx1 if gx1 < ex1 else ex1
+            gy1 = gy1 if gy1 < ey1 else ey1
+            gx2 = gx2 if gx2 > ex2 else ex2
+            gy2 = gy2 if gy2 > ey2 else ey2
+            ga = (gx2 - gx1) * (gy2 - gy1)
+            if side is left:
+                lx1, ly1, lx2, ly2, la = gx1, gy1, gx2, gy2, ga
+            else:
+                rx1, ry1, rx2, ry2, ra = gx1, gy1, gx2, gy2, ga
         return left, right
 
     # ------------------------------------------------------------------
@@ -371,7 +464,9 @@ class RTree:
         return results
 
     def close(self) -> None:
+        self.flush_pages()
         self.flush_header()
+        self._cache.clear()
         self._file.close()
 
     def __enter__(self) -> "RTree":
