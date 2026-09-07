@@ -81,6 +81,28 @@ class BPlusTree:
         self.key_size = key_size
         self.encode = encode
         self.decode = decode
+        # Modo de carga masiva: con ``defer_header`` la cabecera se vuelca
+        # una sola vez al final (``flush_header``/``close``) en vez de en
+        # cada inserción.
+        self.defer_header = False
+        self._header_dirty = False
+        # Caché write-through de nodos decodificados (página -> nodo):
+        # evita re-decodificar todo el camino de raíz a hoja en cada
+        # operación. Todas las mutaciones pasan por ``_store_node``, que
+        # actualiza la caché junto con el disco, así que nunca queda
+        # desincronizada. Con tope: al llenarse se vacía completa.
+        self._cache: dict[int, object] = {}
+        self._cache_max = 1024
+        # Buffer pool para carga masiva: con ``defer_flush`` los nodos
+        # modificados se mantienen en memoria (pendientes de serializar)
+        # y se escriben una sola vez al final (``flush_pages``/``close``),
+        # en vez de re-serializar y reescribir la página en cada
+        # inserción. Los nodos solo se mutan antes de ``_store_node``, que
+        # siempre actualiza la caché y los pendientes, así que ambos ven
+        # el último estado. Con tope: al llenarse se vuelca y se vacía.
+        self.defer_flush = False
+        self._pending: dict[int, object] = {}
+        self._pending_max = 4096
         # Capacidades calculadas para que un nodo quepa en 4 KB.
         self.leaf_cap = max(2, (PAGE_SIZE - LEAF_HEADER_SIZE) // (key_size + RID_SIZE))
         self.internal_cap = max(
@@ -101,6 +123,12 @@ class BPlusTree:
     # Cabecera y páginas
     # ------------------------------------------------------------------
     def _write_header(self) -> None:
+        if self.defer_header:
+            self._header_dirty = True
+            return
+        self._flush_header()
+
+    def _flush_header(self) -> None:
         buf = bytearray(PAGE_SIZE)
         struct.pack_into(
             HEADER_FMT, buf, 0, MAGIC, self.root_page, self.page_count, self.key_size
@@ -108,6 +136,12 @@ class BPlusTree:
         self._file.seek(0)
         self._file.write(buf)
         self._file.flush()
+        self._header_dirty = False
+
+    def flush_header(self) -> None:
+        """Vuelca la cabecera a disco si quedó pendiente (carga masiva)."""
+        if self._header_dirty:
+            self._flush_header()
 
     def _read_header(self) -> None:
         self._file.seek(0)
@@ -124,6 +158,11 @@ class BPlusTree:
         return page_id
 
     def _read_raw(self, page_id: int) -> bytes:
+        node = self._pending.get(page_id)
+        if node is not None:
+            # página aún no volcada: se serializa al vuelo (raro: solo si
+            # la caché de nodos se vació antes del volcado)
+            return self._serialize_node(node)
         self._file.seek(page_id * PAGE_SIZE)
         return self._file.read(PAGE_SIZE)
 
@@ -132,10 +171,28 @@ class BPlusTree:
         self._file.write(data)
         self._file.flush()
 
+    def flush_pages(self) -> None:
+        """Serializa y vuelca los nodos pendientes (carga masiva)."""
+        if not self._pending:
+            return
+        for page_id in sorted(self._pending):
+            self._file.seek(page_id * PAGE_SIZE)
+            self._file.write(self._serialize_node(self._pending[page_id]))
+        self._file.flush()
+        self._pending.clear()
+
     # ------------------------------------------------------------------
     # Serialización de nodos
     # ------------------------------------------------------------------
     def _load_node(self, page_id: int):
+        node = self._cache.get(page_id)
+        if node is not None:
+            return node
+        if len(self._cache) >= self._cache_max:
+            # Antes de perder la caché, persistir lo pendiente para que
+            # las re-lecturas posteriores vean el último estado.
+            self.flush_pages()
+            self._cache.clear()
         data = self._read_raw(page_id)
         is_leaf = data[0]
         if is_leaf:
@@ -150,22 +207,23 @@ class BPlusTree:
                 pos += RID_SIZE
                 node.keys.append(key)
                 node.rids.append(rid)
-            return node
-        _, count = struct.unpack_from(INTERNAL_HEADER_FMT, data, 0)
-        node = _Internal()
-        pos = INTERNAL_HEADER_SIZE
-        for _ in range(count):
-            node.keys.append(self.decode(data[pos : pos + self.key_size]))
-            pos += self.key_size
-            node.sep_rids.append(struct.unpack_from(RID_FMT, data, pos))
-            pos += RID_SIZE
-        for _ in range(count + 1):
-            (child,) = struct.unpack_from("<I", data, pos)
-            pos += 4
-            node.children.append(child)
+        else:
+            _, count = struct.unpack_from(INTERNAL_HEADER_FMT, data, 0)
+            node = _Internal()
+            pos = INTERNAL_HEADER_SIZE
+            for _ in range(count):
+                node.keys.append(self.decode(data[pos : pos + self.key_size]))
+                pos += self.key_size
+                node.sep_rids.append(struct.unpack_from(RID_FMT, data, pos))
+                pos += RID_SIZE
+            for _ in range(count + 1):
+                (child,) = struct.unpack_from("<I", data, pos)
+                pos += 4
+                node.children.append(child)
+        self._cache[page_id] = node
         return node
 
-    def _store_node(self, page_id: int, node) -> None:
+    def _serialize_node(self, node) -> bytes:
         buf = bytearray(PAGE_SIZE)
         if isinstance(node, _Leaf):
             struct.pack_into(LEAF_HEADER_FMT, buf, 0, 1, len(node.keys), node.next)
@@ -186,13 +244,30 @@ class BPlusTree:
             for child in node.children:
                 struct.pack_into("<I", buf, pos, child)
                 pos += 4
-        self._write_raw(page_id, bytes(buf))
+        return bytes(buf)
+
+    def _store_node(self, page_id: int, node) -> None:
+        if len(self._cache) >= self._cache_max:
+            self.flush_pages()
+            self._cache.clear()
+        self._cache[page_id] = node
+        if self.defer_flush:
+            if len(self._pending) >= self._pending_max:
+                self.flush_pages()
+            self._pending[page_id] = node
+            return
+        self._write_raw(page_id, self._serialize_node(node))
 
     # ------------------------------------------------------------------
     # Navegación
     # ------------------------------------------------------------------
     def _child_index(self, node: _Internal, key, rid: RID) -> int:
         """Índice del hijo que contendría la entrada ``(key, rid)``."""
+        # Camino rápido para claves crecientes (común en carga ordenada):
+        # si la entrada es mayor o igual que el último separador, va al
+        # último hijo. Equivalente al barrido lineal de abajo.
+        if node.keys and (key, rid) >= (node.keys[-1], node.sep_rids[-1]):
+            return len(node.keys)
         i = 0
         while i < len(node.keys) and (key, rid) >= (node.keys[i], node.sep_rids[i]):
             i += 1
@@ -226,13 +301,20 @@ class BPlusTree:
         """Inserta y devuelve ``(sep_key, sep_rid, new_page)`` si hubo split."""
         node = self._load_node(page_id)
         if isinstance(node, _Leaf):
-            entries = sorted(zip(node.keys, node.rids))
-            pos = bisect_left(entries, (key, rid))
-            if pos < len(entries) and entries[pos] == (key, rid):
-                raise KeyError(f"entrada duplicada: {key!r} {rid}")
-            entries.insert(pos, (key, rid))
-            node.keys = [k for k, _ in entries]
-            node.rids = [r for _, r in entries]
+            if not node.keys or (key, rid) > (node.keys[-1], node.rids[-1]):
+                # Inserción al final de la hoja (carga ordenada): O(1),
+                # sin reordenar. Un duplicado exacto de la última entrada
+                # cae en el camino general, que lo detecta.
+                node.keys.append(key)
+                node.rids.append(rid)
+            else:
+                entries = sorted(zip(node.keys, node.rids))
+                pos = bisect_left(entries, (key, rid))
+                if pos < len(entries) and entries[pos] == (key, rid):
+                    raise KeyError(f"entrada duplicada: {key!r} {rid}")
+                entries.insert(pos, (key, rid))
+                node.keys = [k for k, _ in entries]
+                node.rids = [r for _, r in entries]
             if len(node.keys) <= self.leaf_cap:
                 self._store_node(page_id, node)
                 return None
@@ -347,6 +429,9 @@ class BPlusTree:
         self._store_node(page_id, leaf)
 
     def close(self) -> None:
+        self.flush_pages()
+        self.flush_header()
+        self._cache.clear()
         self._file.close()
 
     def __enter__(self) -> "BPlusTree":

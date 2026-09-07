@@ -63,6 +63,11 @@ class ExtendibleHash:
         self.key_size = key_size
         self.encode = encode
         self.decode = decode
+        # Modo de carga masiva: con ``defer_flush`` el archivo (de
+        # reescritura completa por mutación) se vuelca una sola vez al
+        # final (``flush``/``close``) en vez de tras cada inserción.
+        self.defer_flush = False
+        self._dirty = False
         self.bucket_cap = max(
             2, (PAGE_SIZE - BUCKET_HEADER_SIZE) // (key_size + RID_SIZE)
         )
@@ -167,7 +172,7 @@ class ExtendibleHash:
         if len(bucket.keys) < self.bucket_cap:
             bucket.keys.append(key)
             bucket.rids.append(rid)
-            self._flush()
+            self._mark_dirty()
             return
 
         # Overflow: split del bucket (duplicando el directorio si hace falta)
@@ -212,9 +217,23 @@ class ExtendibleHash:
             raise KeyError(f"entrada no encontrada: {key!r} {rid}") from None
         bucket.keys = [k for k, _ in entries]
         bucket.rids = [r for _, r in entries]
-        self._flush()
+        self._mark_dirty()
+
+    def _mark_dirty(self) -> None:
+        """Persiste la mutación, o la acumula si el volcado está diferido."""
+        if self.defer_flush:
+            self._dirty = True
+        else:
+            self._flush()
+
+    def flush(self) -> None:
+        """Vuelca el archivo a disco si quedó pendiente (carga masiva)."""
+        if self._dirty:
+            self._flush()
+            self._dirty = False
 
     def close(self) -> None:
+        self.flush()
         self._file.close()
 
     def __enter__(self) -> "ExtendibleHash":

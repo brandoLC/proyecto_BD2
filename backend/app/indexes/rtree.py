@@ -85,6 +85,10 @@ class RTree:
                  create: bool = False) -> None:
         self.path = path
         default_m = max(2, (PAGE_SIZE - NODE_HEADER_SIZE) // LEAF_ENTRY_SIZE)
+        # Modo de carga masiva: con ``defer_header`` la cabecera se vuelca
+        # una sola vez al final (``flush_header``/``close``).
+        self.defer_header = False
+        self._header_dirty = False
         if create or not os.path.exists(path):
             self.max_entries = max_entries or default_m
             if self.max_entries < 2:
@@ -104,6 +108,12 @@ class RTree:
     # Cabecera y páginas
     # ------------------------------------------------------------------
     def _write_header(self) -> None:
+        if self.defer_header:
+            self._header_dirty = True
+            return
+        self._flush_header()
+
+    def _flush_header(self) -> None:
         buf = bytearray(PAGE_SIZE)
         struct.pack_into(
             HEADER_FMT, buf, 0, MAGIC, self.root_page, self.page_count,
@@ -112,6 +122,12 @@ class RTree:
         self._file.seek(0)
         self._file.write(buf)
         self._file.flush()
+        self._header_dirty = False
+
+    def flush_header(self) -> None:
+        """Vuelca la cabecera a disco si quedó pendiente (carga masiva)."""
+        if self._header_dirty:
+            self._flush_header()
 
     def _read_header(self) -> None:
         self._file.seek(0)
@@ -355,6 +371,7 @@ class RTree:
         return results
 
     def close(self) -> None:
+        self.flush_header()
         self._file.close()
 
     def __enter__(self) -> "RTree":

@@ -190,6 +190,18 @@ Las filas se insertan por el mismo camino del motor que un `INSERT`
 normal, así que el heap file y todos los índices de la tabla quedan
 actualizados.
 
+**Carga masiva**: en `FROM FILE`/`LOAD INTO`/`upload-csv` el heap file y
+los índices se abren una sola vez para toda la carga, con el volcado de
+cabecera y de páginas diferido (write-back) hasta el final, y la
+verificación de unicidad de la PK usa un conjunto en memoria sembrado
+con las claves existentes (equivalente a consultar el índice fila por
+fila). El B+ Tree además cachea nodos decodificados en memoria y tiene
+un fast-path para inserciones de clave creciente. Con todo, la carga de
+100 000 filas tarda ~1 s (~110 000 filas/s, lineal), frente a ~68 s
+antes de la optimización. Los flags `defer_header`/`defer_flush` son
+opcionales y por defecto desactivados: las rutas normales (INSERT,
+SELECT, DELETE) conservan su persistencia inmediata.
+
 ## Ejecutar localmente
 
 ```bash

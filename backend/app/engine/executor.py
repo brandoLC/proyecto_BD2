@@ -60,6 +60,11 @@ RID = tuple[int, int]
 
 INDEX_EXT = {"BTREE": "btree", "HASH": "hash", "RTREE": "rtree"}
 
+# A partir de este número de filas, la verificación de unicidad de la PK
+# en carga masiva siembra un conjunto con las claves existentes en vez de
+# consultar el índice fila por fila (equivalente y mucho más rápido).
+_BULK_PK_SET_MIN = 512
+
 
 def _ms(t0: float) -> float:
     return round((time.perf_counter() - t0) * 1000, 3)
@@ -485,6 +490,10 @@ class Engine:
 
         t = time.perf_counter()
         col_pos = [c.name for c in self.catalog.columns(table)].index(col_name)
+        if hasattr(idx, "defer_header"):  # BPlusTree/RTree
+            idx.defer_header = True
+        if hasattr(idx, "defer_flush"):  # BPlusTree/RTree/ExtendibleHash
+            idx.defer_flush = True
         n = 0
         for rid, raw in heap.scan():
             row = deserialize_row(self.catalog.columns(table), raw)
@@ -595,6 +604,14 @@ class Engine:
                          f"{meta['type']} ON {table}.{col.name} actualizado", t)
         return rid
 
+    def _open_index(self, table: str, itype: str, col: Column):
+        """Abre el índice ``itype`` de ``table`` sobre la columna ``col``."""
+        if itype == "BTREE":
+            return self._open_btree(table, col)
+        if itype == "HASH":
+            return self._open_hash(table, col)
+        return self._open_rtree(table, col)
+
     def bulk_load_rows(self, table: str,
                        rows: list[tuple[int, list[str]]],
                        derive: tuple[int, str] | None = None) -> dict:
@@ -609,44 +626,119 @@ class Engine:
         EXTRA al final (latitud y longitud): se construye el punto
         ``(lat, lng)`` y se inserta en ``posicion`` antes del casteo; si
         no son numéricos la fila se rechaza como ``lat/lng inválidos``.
+
+        El heap file y todos los índices se abren una sola vez y con el
+        volcado de cabecera diferido (se persiste todo al cerrar), en vez
+        de abrir/cerrar y reescribir cabeceras por fila. La unicidad de
+        la PRIMARY KEY se verifica igual que en ``_insert_row`` (índice
+        o escaneo por fila); en cargas grandes se siembra un conjunto
+        con las claves existentes, lo cual es equivalente: contiene
+        exactamente los mismos valores que encontraría el índice.
         """
         columns = self._get_columns(table)
         loaded = rejected = 0
         errors: list[dict] = []
         expected = len(columns) + (1 if derive else 0)
-        for line_no, raw_row in rows:
-            if len(raw_row) != expected:
-                rejected += 1
-                if len(errors) < MAX_ERRORS:
-                    errors.append({
-                        "line": line_no,
-                        "reason": f"se esperaban {expected} valores, "
-                                  f"llegaron {len(raw_row)}",
-                    })
-                continue
-            if derive is not None:
-                point_pos, point_name = derive
-                try:
-                    point = derive_point_value(raw_row[-2], raw_row[-1],
-                                               point_name, line_no)
-                except ValueError as exc:
+        pk = self.catalog.primary_key(table)
+        pk_pos = ([c.name for c in columns].index(pk.name)
+                  if pk is not None else None)
+
+        heap = self._open_heap(table)
+        heap.defer_header = True
+        heap.defer_flush = True
+        col_names = [c.name for c in columns]
+        idx_entries: list[tuple[dict, Column, int, object]] = []
+        for meta in self.catalog.indexes(table):
+            col = self.catalog.column(table, meta["column"])
+            idx = self._open_index(table, meta["type"], col)
+            if hasattr(idx, "defer_header"):  # BPlusTree/RTree
+                idx.defer_header = True
+            idx.defer_flush = True  # write-back durante toda la carga
+            idx_entries.append(
+                (meta, col, col_names.index(col.name), idx))
+        pk_idx = next(
+            (e for e in idx_entries
+             if pk is not None and e[1].name == pk.name
+             and e[0]["type"] in ("BTREE", "HASH")), None)
+
+        pk_seen: set | None = None
+        if pk is not None and len(rows) >= _BULK_PK_SET_MIN:
+            pk_seen = set()
+            if pk_idx is not None and pk_idx[0]["type"] == "BTREE":
+                for key, _rid in pk_idx[3].range_search():
+                    pk_seen.add(key)
+            else:  # HASH sin recorrido, o PK sin índice: una pasada al heap
+                for _rid, raw in heap.scan():
+                    pk_seen.add(deserialize_row(columns, raw)[pk_pos])
+
+        try:
+            for line_no, raw_row in rows:
+                if len(raw_row) != expected:
                     rejected += 1
                     if len(errors) < MAX_ERRORS:
-                        errors.append({"line": line_no, "reason": str(exc)})
+                        errors.append({
+                            "line": line_no,
+                            "reason": f"se esperaban {expected} valores, "
+                                      f"llegaron {len(raw_row)}",
+                        })
                     continue
-                raw_row = list(raw_row[:-2])
-                raw_row.insert(point_pos, point)
-            try:
-                row = [None if c.auto and v.strip() == ""
-                       else cast_csv_value(v, c)
-                       for v, c in zip(raw_row, columns)]
-                self._insert_row(table, columns, row)
-            except (ValueError, SerializationError, ExecutionError) as exc:
-                rejected += 1
-                if len(errors) < MAX_ERRORS:
-                    errors.append({"line": line_no, "reason": str(exc)})
-                continue
-            loaded += 1
+                if derive is not None:
+                    point_pos, point_name = derive
+                    try:
+                        point = derive_point_value(raw_row[-2], raw_row[-1],
+                                                   point_name, line_no)
+                    except ValueError as exc:
+                        rejected += 1
+                        if len(errors) < MAX_ERRORS:
+                            errors.append({"line": line_no,
+                                           "reason": str(exc)})
+                        continue
+                    raw_row = list(raw_row[:-2])
+                    raw_row.insert(point_pos, point)
+                try:
+                    row = [None if c.auto and v.strip() == ""
+                           else cast_csv_value(v, c)
+                           for v, c in zip(raw_row, columns)]
+                    if pk is not None:
+                        # Mismo orden que _insert_row: asignar/adelantar
+                        # la secuencia ANTES de verificar la unicidad.
+                        if pk.auto:
+                            if row[pk_pos] is None:
+                                row[pk_pos] = self._next_auto_id(table)
+                            else:
+                                self._bump_auto_seq(table, row[pk_pos])
+                        value = row[pk_pos]
+                        if pk_seen is not None:
+                            duplicate = value in pk_seen
+                        elif pk_idx is not None:
+                            duplicate = bool(pk_idx[3].search(value))
+                        else:
+                            duplicate = any(
+                                deserialize_row(columns, raw)[pk_pos] == value
+                                for _r, raw in heap.scan())
+                        if duplicate:
+                            raise ExecutionError(
+                                f"clave primaria duplicada: "
+                                f"{pk.name} = {value!r}")
+                        if pk_seen is not None:
+                            pk_seen.add(value)
+                    rid = heap.insert(serialize_row(columns, row))
+                    for _meta, col, col_pos, idx in idx_entries:
+                        v = row[col_pos]
+                        idx.insert(tuple(v) if col.type == TYPE_POINT
+                                   else v, rid)
+                except (ValueError, SerializationError,
+                        ExecutionError) as exc:
+                    rejected += 1
+                    if len(errors) < MAX_ERRORS:
+                        errors.append({"line": line_no,
+                                       "reason": str(exc)})
+                    continue
+                loaded += 1
+        finally:
+            heap.close()
+            for _meta, _col, _pos, idx in idx_entries:
+                idx.close()
         self._flush_seq()
         return {"rows_loaded": loaded, "rows_rejected": rejected,
                 "errors": errors}
@@ -680,12 +772,20 @@ class Engine:
 
         t = time.perf_counter()
         heap = self._open_heap(table)
+        limit = ast["limit"]
         if rids is None:  # escaneo secuencial
-            rows = [(rid, deserialize_row(columns, raw))
-                    for rid, raw in heap.scan()]
-            if where is not None:
-                rows = [(rid, row) for rid, row in rows
-                        if self._match(columns, where, row)]
+            # El LIMIT se empuja al escaneo: se detiene apenas junta las
+            # filas pedidas (salvo KNN por fuerza bruta, que necesita todas).
+            early_stop = limit is not None and not (
+                where is not None and where["kind"] == "knn")
+            rows = []
+            for rid, raw in heap.scan():
+                row = deserialize_row(columns, raw)
+                if where is not None and not self._match(columns, where, row):
+                    continue
+                rows.append((rid, row))
+                if early_stop and len(rows) >= limit:
+                    break
             if where is not None and where["kind"] == "knn":
                 # KNN por fuerza bruta cuando no hay R-Tree
                 pos = [c.name for c in columns].index(where["column"])
@@ -699,6 +799,8 @@ class Engine:
                 by_rid[rid] = deserialize_row(columns, heap.read(rid))
             rows = [(rid, by_rid[rid]) for rid, _ in ordered_knn]
         else:
+            if limit is not None and ordered_knn is None:
+                rids = rids[:limit]  # pushdown: los RIDs ya cumplen el WHERE
             rows = [(rid, deserialize_row(columns, heap.read(rid)))
                     for rid in rids]
         heap.close()

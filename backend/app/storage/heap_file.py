@@ -39,6 +39,21 @@ class HeapFile:
 
     def __init__(self, path: str, create: bool = False) -> None:
         self.path = path
+        # Modo de carga masiva: si ``defer_header`` está activo, la
+        # cabecera no se reescribe en disco en cada mutación; se marca
+        # pendiente y se vuelca al final (``flush_header``/``close``).
+        self.defer_header = False
+        self._header_dirty = False
+        # Buffer pool mínimo para carga masiva: con ``defer_flush`` las
+        # páginas se mantienen en memoria (write-back) y se vuelcan al
+        # final (``flush_pages``/``close``) en vez de reescribirse en
+        # disco con flush en cada mutación. Todas las escrituras pasan
+        # por ``_write_page``, así que el disco nunca queda desactualizado
+        # tras un volcado. Con tope: al llenarse se vuelca y se vacía.
+        self.defer_flush = False
+        self._page_cache: dict[int, SlottedPage] = {}
+        self._dirty_pages: set[int] = set()
+        self._page_cache_max = 4096
         if create or not os.path.exists(path):
             self.page_count = 1  # página 0 = cabecera
             self.row_count = 0
@@ -68,6 +83,12 @@ class HeapFile:
             self.free_list.append((page_id, slot_id))
 
     def _write_header(self) -> None:
+        if self.defer_header:
+            self._header_dirty = True
+            return
+        self._flush_header()
+
+    def _flush_header(self) -> None:
         buf = bytearray(PAGE_SIZE)
         struct.pack_into(
             HEADER_FMT, buf, 0, MAGIC, self.page_count, self.row_count,
@@ -81,19 +102,49 @@ class HeapFile:
         self._file.seek(0)
         self._file.write(buf)
         self._file.flush()
+        self._header_dirty = False
+
+    def flush_header(self) -> None:
+        """Vuelca la cabecera a disco si quedó pendiente (carga masiva)."""
+        if self._header_dirty:
+            self._flush_header()
 
     # ------------------------------------------------------------------
     # Páginas
     # ------------------------------------------------------------------
     def _read_page(self, page_id: int) -> SlottedPage:
+        page = self._page_cache.get(page_id)
+        if page is not None:
+            return page
         self._file.seek(page_id * PAGE_SIZE)
         data = self._file.read(PAGE_SIZE)
-        return SlottedPage.from_bytes(data)
+        page = SlottedPage.from_bytes(data)
+        self._cache_page(page_id, page)
+        return page
+
+    def _cache_page(self, page_id: int, page: SlottedPage) -> None:
+        if len(self._page_cache) >= self._page_cache_max:
+            self.flush_pages()
+        self._page_cache[page_id] = page
 
     def _write_page(self, page_id: int, page: SlottedPage) -> None:
+        if self.defer_flush:
+            self._cache_page(page_id, page)
+            self._dirty_pages.add(page_id)
+            return
         self._file.seek(page_id * PAGE_SIZE)
         self._file.write(page.to_bytes())
         self._file.flush()
+
+    def flush_pages(self) -> None:
+        """Vuelca las páginas modificadas a disco (carga masiva)."""
+        for page_id in sorted(self._dirty_pages):
+            self._file.seek(page_id * PAGE_SIZE)
+            self._file.write(self._page_cache[page_id].to_bytes())
+        if self._dirty_pages:
+            self._file.flush()
+        self._dirty_pages.clear()
+        self._page_cache.clear()
 
     def _append_page(self) -> int:
         page = SlottedPage()
@@ -194,6 +245,8 @@ class HeapFile:
                 yield (page_id, slot_id), record
 
     def close(self) -> None:
+        self.flush_pages()
+        self.flush_header()
         self._file.close()
 
     def __enter__(self) -> "HeapFile":
