@@ -135,7 +135,7 @@ export default function App() {
       if (!query) return
       const effective =
         pageNum > 0
-          ? `${query} LIMIT ${PAGE_SIZE} OFFSET ${pageNum * PAGE_SIZE}`
+          ? `${query.replace(/;\s*$/, '')} LIMIT ${PAGE_SIZE} OFFSET ${pageNum * PAGE_SIZE}`
           : query
       setExecuting(true)
       if (pageNum > 0) setPagerLoading(true)
