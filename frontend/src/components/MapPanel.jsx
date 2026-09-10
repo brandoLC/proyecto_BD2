@@ -1,5 +1,5 @@
 // Pestaña Mapa: puntos espaciales sobre OpenStreetMap (Lima por defecto).
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import L from 'leaflet'
 import { MapContainer, TileLayer, CircleMarker, Circle, Popup, useMap } from 'react-leaflet'
 
@@ -76,7 +76,18 @@ function FitBounds({ points, radiusCircle }) {
 }
 
 export default function MapPanel({ result, sql, theme = 'light' }) {
+  const [expanded, setExpanded] = useState(false)
   const spatial = result?.spatial
+
+  // Cerrar el mapa ampliado con Escape.
+  useEffect(() => {
+    if (!expanded) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') setExpanded(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [expanded])
 
   if (!spatial || !spatial.points || spatial.points.length === 0) {
     return (
@@ -88,48 +99,89 @@ export default function MapPanel({ result, sql, theme = 'light' }) {
 
   const radius = parseRadius(sql)
 
-  return (
-    <div className="overflow-hidden rounded-input border border-hairline">
-      <MapContainer center={LIMA} zoom={13} style={{ height: '420px', width: '100%' }}>
-        <FitBounds points={spatial.points} radiusCircle={radius} />
-        <TileLayer
-          // key por tema: fuerza el remontaje de la capa al cambiar claro/oscuro.
-          key={theme}
-          attribution={TILES[theme].attribution}
-          url={TILES[theme].url}
+  const map = (
+    // key: fuerza el remontaje al cambiar de tamaño (Leaflet se recalcula
+    // limpio en el contenedor nuevo, sin invalidateSize manual).
+    <MapContainer
+      key={expanded ? 'expanded' : 'inline'}
+      center={LIMA}
+      zoom={13}
+      style={{ height: '100%', width: '100%' }}
+    >
+      <FitBounds points={spatial.points} radiusCircle={radius} />
+      <TileLayer
+        // key por tema: fuerza el remontaje de la capa al cambiar claro/oscuro.
+        key={theme}
+        attribution={TILES[theme].attribution}
+        url={TILES[theme].url}
+      />
+      {radius && (
+        <Circle
+          center={radius.center}
+          // El radio viene en grados; aproximación a metros (1° ≈ 111 320 m).
+          radius={radius.radius * 111320}
+          pathOptions={{ color: ACCENT, weight: 1.5, fillOpacity: 0.08 }}
         />
-        {radius && (
-          <Circle
-            center={radius.center}
-            // El radio viene en grados; aproximación a metros (1° ≈ 111 320 m).
-            radius={radius.radius * 111320}
-            pathOptions={{ color: ACCENT, weight: 1.5, fillOpacity: 0.08 }}
-          />
-        )}
-        {spatial.points.map((p, i) => (
-          <CircleMarker
-            key={i}
-            center={[p.x, p.y]}
-            radius={7}
-            pathOptions={{ color: ACCENT, fillColor: ACCENT, fillOpacity: 0.85, weight: 2 }}
+      )}
+      {spatial.points.map((p, i) => (
+        <CircleMarker
+          key={i}
+          center={[p.x, p.y]}
+          radius={7}
+          pathOptions={{ color: ACCENT, fillColor: ACCENT, fillOpacity: 0.85, weight: 2 }}
+        >
+          <Popup>
+            <div className="font-mono text-xs">
+              <p className="mb-1 font-medium">
+                ({p.x}, {p.y})
+              </p>
+              {p.row && p.row.length > 0 && (
+                <ul>
+                  {p.row.map((cell, j) => (
+                    <li key={j}>{String(cell)}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </Popup>
+        </CircleMarker>
+      ))}
+    </MapContainer>
+  )
+
+  return (
+    <>
+      <div className="relative overflow-hidden rounded-input border border-hairline">
+        <div style={{ height: '420px' }}>{map}</div>
+        <button
+          onClick={() => setExpanded(true)}
+          title="Ampliar mapa"
+          className="absolute right-2.5 top-2.5 z-[1000] rounded-full border border-hairline bg-surface px-2.5 py-1 text-xs font-medium text-body shadow-card transition-colors hover:bg-canvas hover:text-ink"
+        >
+          ⤢ Ampliar
+        </button>
+      </div>
+
+      {expanded && (
+        <div
+          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60"
+          onClick={() => setExpanded(false)}
+        >
+          <div
+            className="relative h-[90vh] w-[92vw] overflow-hidden rounded-card border border-hairline bg-surface shadow-card"
+            onClick={(e) => e.stopPropagation()}
           >
-            <Popup>
-              <div className="font-mono text-xs">
-                <p className="mb-1 font-medium">
-                  ({p.x}, {p.y})
-                </p>
-                {p.row && p.row.length > 0 && (
-                  <ul>
-                    {p.row.map((cell, j) => (
-                      <li key={j}>{String(cell)}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            </Popup>
-          </CircleMarker>
-        ))}
-      </MapContainer>
-    </div>
+            {map}
+            <button
+              onClick={() => setExpanded(false)}
+              title="Cerrar (Escape)"
+              className="absolute right-2.5 top-2.5 z-[1000] rounded-full border border-hairline bg-surface px-2.5 py-1 text-xs font-medium text-body shadow-card transition-colors hover:bg-canvas hover:text-ink"
+            >
+              ✕ Cerrar
+            </button>
+          </div>
+        </div>
+      )}
+    </>
   )
 }
