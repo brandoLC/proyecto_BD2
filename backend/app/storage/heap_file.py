@@ -19,6 +19,7 @@ import os
 import struct
 from typing import Iterator
 
+from .disk_counter import CountedFile, DiskCounter
 from .page import PAGE_SIZE, PageFullError, SlottedPage
 
 MAGIC = b"HEAP"
@@ -37,7 +38,8 @@ RID = tuple[int, int]
 class HeapFile:
     """Archivo heap sobre páginas de 4 KB con lista de slots libres."""
 
-    def __init__(self, path: str, create: bool = False) -> None:
+    def __init__(self, path: str, create: bool = False,
+                 counter: DiskCounter | None = None) -> None:
         self.path = path
         # Modo de carga masiva: si ``defer_header`` está activo, la
         # cabecera no se reescribe en disco en cada mutación; se marca
@@ -60,9 +62,13 @@ class HeapFile:
             self.free_list: list[RID] = []
             self.dropped_free = 0  # slots muertos que no cupieron en la lista
             self._file = open(path, "w+b")
+            if counter is not None:
+                self._file = CountedFile(self._file, counter)
             self._write_header()
         else:
             self._file = open(path, "r+b")
+            if counter is not None:
+                self._file = CountedFile(self._file, counter)
             self._read_header()
 
     # ------------------------------------------------------------------

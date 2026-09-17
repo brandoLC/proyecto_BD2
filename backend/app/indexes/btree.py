@@ -25,6 +25,7 @@ import os
 import struct
 from bisect import bisect_left
 
+from ..storage.disk_counter import CountedFile, DiskCounter
 from ..storage.page import PAGE_SIZE
 
 MAGIC = b"BPT1"
@@ -76,6 +77,7 @@ class BPlusTree:
         encode,
         decode,
         create: bool = False,
+        counter: DiskCounter | None = None,
     ) -> None:
         self.path = path
         self.key_size = key_size
@@ -112,11 +114,15 @@ class BPlusTree:
             self.root_page = 1
             self.page_count = 2
             self._file = open(path, "w+b")
+            if counter is not None:
+                self._file = CountedFile(self._file, counter)
             leaf = _Leaf()
             self._store_node(self.root_page, leaf)
             self._write_header()
         else:
             self._file = open(path, "r+b")
+            if counter is not None:
+                self._file = CountedFile(self._file, counter)
             self._read_header()
 
     # ------------------------------------------------------------------

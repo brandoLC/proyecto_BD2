@@ -44,13 +44,20 @@ class Catalog:
     def has_table(self, name: str) -> bool:
         return name in self._data["tables"]
 
-    def create_table(self, name: str, columns: list[Column]) -> None:
+    def create_table(self, name: str, columns: list[Column],
+                     organization: str = "heap") -> None:
         self._data["tables"][name] = {
             "columns": [c.to_dict() for c in columns],
             "indexes": [],
             "auto_seq": 1,  # siguiente valor de la PK implícita SERIAL
+            "organization": organization,
         }
         self._save()
+
+    def organization(self, table: str) -> str:
+        """``"heap"`` o ``"sequential"``; "heap" si el campo no existe
+        (compatibilidad con catalog.json anteriores)."""
+        return self._data["tables"][table].get("organization", "heap")
 
     def drop_table(self, name: str) -> None:
         del self._data["tables"][name]

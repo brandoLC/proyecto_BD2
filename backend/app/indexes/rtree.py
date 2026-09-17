@@ -22,6 +22,7 @@ import math
 import os
 import struct
 
+from ..storage.disk_counter import CountedFile, DiskCounter
 from ..storage.page import PAGE_SIZE
 
 MAGIC = b"RTR1"
@@ -90,7 +91,8 @@ class RTree:
     """R-Tree con split cuadrático, persistido en páginas de 4 KB."""
 
     def __init__(self, path: str, max_entries: int | None = None,
-                 create: bool = False) -> None:
+                 create: bool = False,
+                 counter: DiskCounter | None = None) -> None:
         self.path = path
         default_m = max(2, (PAGE_SIZE - NODE_HEADER_SIZE) // LEAF_ENTRY_SIZE)
         # Modo de carga masiva: con ``defer_header`` la cabecera se vuelca
@@ -119,10 +121,14 @@ class RTree:
             self.root_page = 1
             self.page_count = 2
             self._file = open(path, "w+b")
+            if counter is not None:
+                self._file = CountedFile(self._file, counter)
             self._store_node(self.root_page, _Node(True))
             self._write_header()
         else:
             self._file = open(path, "r+b")
+            if counter is not None:
+                self._file = CountedFile(self._file, counter)
             self._read_header()
             if max_entries is not None and max_entries != self.max_entries:
                 raise ValueError("max_entries incompatible con el archivo")

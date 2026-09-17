@@ -36,8 +36,7 @@ class TestExtendibleHash:
             for i, k in enumerate(keys):
                 h.insert(k, (i, i % 4))
             assert h.global_depth > g0
-            assert len(h.directory) == 1 << h.global_depth
-            assert len(h.buckets) > 2
+            assert h.num_buckets > 2
             for i, k in enumerate(keys):
                 assert h.search(k) == [(i, i % 4)]
 
@@ -67,6 +66,52 @@ class TestExtendibleHash:
                 assert h.search(k) == [(i, 5)]
             with pytest.raises(KeyError):
                 h.delete(keys[0], (0, 5))
+
+class TestExtendibleHashIO:
+    """El formato EXH2 pagina bajo demanda: búsqueda e inserción tocan
+    O(1) bloques, no el archivo completo (regresión del EXH1)."""
+
+    def test_busqueda_puntual_lee_pocos_bloques(self, tmp_path):
+        keys = random.Random(9).sample(range(200_000), 10_000)
+        with make_hash(tmp_path) as h:
+            h.defer_flush = True
+            for i, k in enumerate(keys):
+                h.insert(k, (i, 0))
+            h.flush()
+
+        # Instancia fría instrumentada: cabecera + página de directorio
+        # + página de bucket.
+        from app.storage.disk_counter import DiskCounter
+        counter = DiskCounter()
+        with ExtendibleHash(
+                str(tmp_path / "t.hash"), 4,
+                lambda v: struct.pack("<i", v),
+                lambda b: struct.unpack("<i", b)[0],
+                counter=counter) as h:
+            assert h.search(keys[0]) == [(0, 0)]
+            assert counter.reads <= 6
+            counter.reset()
+            assert h.search(keys[5000]) == [(5000, 0)]
+            assert counter.reads <= 3  # cachés calientes: dir + bucket
+
+    def test_insercion_escribe_paginas_afectadas(self, tmp_path):
+        from app.storage.disk_counter import DiskCounter
+        counter = DiskCounter()
+        with ExtendibleHash(
+                str(tmp_path / "t.hash"), 4,
+                lambda v: struct.pack("<i", v),
+                lambda b: struct.unpack("<i", b)[0],
+                create=True, counter=counter) as h:
+            # Inserción sin split: solo la página del bucket.
+            counter.reset()
+            h.insert(12345, (1, 0))
+            assert counter.writes == 1
+            # Amortizado: 5000 inserciones escriben ~1 página cada una
+            # (el EXH1 reescribía el archivo completo por inserción).
+            counter.reset()
+            for i in range(5000):
+                h.insert(i, (i, 0))
+            assert counter.writes < 2 * 5000
 
     def test_persistencia(self, tmp_path):
         rng = random.Random(5)

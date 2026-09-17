@@ -10,6 +10,7 @@ dist/
 
 # Datos del motor
 data/
+benchmarks/results/
 
 # PDFs del curso (material del profesor, no va al repo)
 *.pdf

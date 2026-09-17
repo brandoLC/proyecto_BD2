@@ -21,6 +21,14 @@ const EXAMPLES = [
     label: 'CREATE TABLE desde CSV',
     sql: `CREATE TABLE restaurantes FROM FILE "restaurantes.csv";`,
   },
+  {
+    label: 'CREATE TABLE sequential',
+    sql: `CREATE TABLE empleados (id INT PRIMARY KEY, nombre VARCHAR(30), salario FLOAT) USING SEQUENTIAL;`,
+  },
+  {
+    label: 'Rango sobre tabla sequential',
+    sql: `SELECT * FROM empleados WHERE id BETWEEN 10 AND 20;`,
+  },
 ]
 
 function shortLabel(q) {

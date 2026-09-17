@@ -37,9 +37,22 @@ export default function PlanPanel({ result }) {
           </li>
         ))}
       </ol>
-      {total != null && (
+      {(total != null || result?.io) && (
         <p className="mt-4 border-t border-hairline pt-3 text-right font-mono text-xs text-body">
-          Tiempo total: <span className="text-ink">{total} ms</span>
+          {total != null && (
+            <>
+              Tiempo total: <span className="text-ink">{total} ms</span>
+            </>
+          )}
+          {result?.io && (
+            <>
+              {total != null && ' · '}
+              I/O:{' '}
+              <span className="text-ink">
+                {result.io.reads} lecturas · {result.io.writes} escrituras
+              </span>
+            </>
+          )}
         </p>
       )}
     </div>

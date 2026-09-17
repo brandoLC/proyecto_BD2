@@ -24,6 +24,58 @@ const INDEX_DOT = {
   RTREE: 'bg-teal-500',
 }
 
+// Resultado de "Reorganizar" en una tabla sequential: éxito (verde) con
+// las estadísticas de compactación, o error de la API.
+function ReorgStatus({ status, onDismiss }) {
+  if (!status) return null
+
+  const dismissBtn = onDismiss && (
+    <button
+      type="button"
+      onClick={onDismiss}
+      title="Cerrar"
+      className="shrink-0 rounded-full px-1.5 text-helper transition-colors hover:text-ink"
+    >
+      ✕
+    </button>
+  )
+
+  if (status.error) {
+    return (
+      <div className="mt-2 rounded-input border border-error/40 bg-error/5 px-3 py-2">
+        <div className="flex items-start gap-2">
+          <p className="font-mono text-[11px] leading-relaxed text-error">
+            {status.error.error}
+          </p>
+          {dismissBtn}
+        </div>
+      </div>
+    )
+  }
+
+  const r = status.result
+  if (!r) return null
+  const s = r.stats || {}
+
+  return (
+    <div className="mt-2 rounded-input border border-success/40 bg-success/5 px-3 py-2">
+      <div className="flex items-start gap-2">
+        <p className="text-xs text-success">
+          Reorganizada en {Math.round(r.elapsed_ms ?? 0)} ms
+        </p>
+        {dismissBtn}
+      </div>
+      <p className="mt-1 font-mono text-[11px] leading-relaxed text-body">
+        páginas {s.pages_before} → {s.pages_after} · overflow {s.ovf_pages_before} →{' '}
+        {s.ovf_pages_after}
+      </p>
+      <p className="font-mono text-[11px] leading-relaxed text-body">
+        {s.rows_moved} registros movidos · {s.dead_purged} muertos purgados
+      </p>
+    </div>
+  )
+}
+
 function TableNode({
   table,
   active,
@@ -33,6 +85,9 @@ function TableNode({
   uploadStatus,
   onPickCsv,
   onDismissCsv,
+  reorgStatus,
+  onReorganize,
+  onDismissReorg,
 }) {
   // column -> tipo de índice, para el punto de color junto a cada columna
   const indexedColumns = {}
@@ -85,6 +140,22 @@ function TableNode({
           >
             {table.name}
           </span>
+          {table.organization && (
+            <span
+              className={`shrink-0 rounded-full border px-1 font-mono text-[9px] leading-tight ${
+                table.organization === 'sequential'
+                  ? 'border-amber-500/60 text-amber-600 dark:text-amber-400'
+                  : 'border-hairline text-helper'
+              }`}
+              title={
+                table.organization === 'sequential'
+                  ? 'Archivo secuencial ordenado'
+                  : 'Archivo heap'
+              }
+            >
+              {table.organization === 'sequential' ? 'SEQ' : 'HEAP'}
+            </span>
+          )}
           <span className="shrink-0 font-mono text-[11px] text-helper">
             {table.rowcount} filas
           </span>
@@ -167,7 +238,7 @@ function TableNode({
             </>
           )}
 
-          <div className="mt-3 flex items-center justify-between gap-2">
+          <div className="mt-3 flex items-center gap-2">
             <button
               type="button"
               onClick={() => onPickCsv(table.name)}
@@ -190,14 +261,42 @@ function TableNode({
               </svg>
               {uploadStatus?.loading ? 'Cargando…' : 'Cargar CSV'}
             </button>
-            {uploadStatus?.loading && (
-              <span className="h-3 w-3 animate-spin rounded-full border border-helper border-t-transparent" />
+            {table.organization === 'sequential' && (
+              <button
+                type="button"
+                onClick={() => onReorganize(table.name)}
+                disabled={reorgStatus?.loading}
+                title={`Compactar el archivo sequential de ${table.name}`}
+                className="inline-flex items-center gap-1.5 rounded-full border border-hairline px-3 py-1 text-xs text-ink transition-colors hover:bg-canvas disabled:opacity-50"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-3.5 w-3.5"
+                  aria-hidden="true"
+                >
+                  <path d="M4 6h16M7 12h10M10 18h4" />
+                </svg>
+                {reorgStatus?.loading ? 'Reorganizando…' : 'Reorganizar'}
+              </button>
+            )}
+            {(uploadStatus?.loading || reorgStatus?.loading) && (
+              <span className="ml-auto h-3 w-3 animate-spin rounded-full border border-helper border-t-transparent" />
             )}
           </div>
 
           <CsvUploadStatus
             status={uploadStatus}
             onDismiss={onDismissCsv}
+          />
+
+          <ReorgStatus
+            status={reorgStatus}
+            onDismiss={onDismissReorg}
           />
         </div>
       )}
@@ -215,6 +314,9 @@ export default function Sidebar({
   csvUploads,
   onUploadCsv,
   onDismissCsv,
+  reorgs,
+  onReorganize,
+  onDismissReorg,
   infer,
   onInfer,
   onClearInfer,
@@ -309,6 +411,9 @@ export default function Sidebar({
             uploadStatus={csvUploads?.[t.name]}
             onPickCsv={openUploadPicker}
             onDismissCsv={onDismissCsv ? () => onDismissCsv(t.name) : undefined}
+            reorgStatus={reorgs?.[t.name]}
+            onReorganize={onReorganize}
+            onDismissReorg={onDismissReorg ? () => onDismissReorg(t.name) : undefined}
           />
         ))}
       </div>

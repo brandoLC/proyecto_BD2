@@ -5,6 +5,7 @@
 - ``POST /api/query``  -> ejecuta una sentencia SQL del subconjunto MiniDB
 - ``POST /api/infer-schema`` -> infiere el esquema de un CSV subido
 - ``POST /api/tables/{name}/upload-csv`` -> carga un CSV en una tabla
+- ``POST /api/tables/{name}/reorganize`` -> reorganiza una tabla SEQUENTIAL
 """
 
 from __future__ import annotations
@@ -114,6 +115,32 @@ async def infer_schema(file: UploadFile = File(...),
     if engine.catalog.has_table(name):
         response["table_exists"] = True
     return response
+
+
+@router.post("/tables/{name}/reorganize")
+def reorganize_table(name: str):
+    """Reorganiza el archivo de una tabla SEQUENTIAL (fill factor 0.75).
+
+    Fusiona el área principal con el overflow, purga registros muertos y
+    devuelve las estadísticas del proceso.
+    """
+    start = time.perf_counter()
+    if not engine.catalog.has_table(name):
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False,
+                     "error": f"la tabla '{name}' no existe"})
+    if engine.catalog.organization(name) != "sequential":
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False,
+                     "error": f"la tabla '{name}' no es SEQUENTIAL "
+                              f"(organización "
+                              f"{engine.catalog.organization(name)}): "
+                              f"solo las tablas SEQUENTIAL se reorganizan"})
+    stats = engine.reorganize(name, fill_factor=0.75)
+    return {"ok": True, "stats": stats,
+            "elapsed_ms": round((time.perf_counter() - start) * 1000, 3)}
 
 
 @router.post("/tables/{name}/upload-csv")

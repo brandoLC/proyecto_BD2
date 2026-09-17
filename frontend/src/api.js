@@ -51,6 +51,27 @@ export async function uploadCsv(tableName, file, derivedPoint) {
   return postForm(`/api/tables/${encodeURIComponent(tableName)}/upload-csv`, form)
 }
 
+// POST reorganize: compacta el archivo sequential de una tabla.
+export async function reorganizeTable(tableName) {
+  const res = await fetch(`/api/tables/${encodeURIComponent(tableName)}/reorganize`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    // 404 si no existe, 409 si no es sequential; puede venir {ok:false}
+    // o el {"detail": ...} de FastAPI.
+    const data = await res.json().catch(() => null)
+    if (data?.ok === false) return data
+    if (data?.detail) {
+      return {
+        ok: false,
+        error: typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail),
+      }
+    }
+    throw new Error(`HTTP ${res.status}`)
+  }
+  return parseResponse(res)
+}
+
 export async function postQuery(sql) {
   const res = await fetch('/api/query', {
     method: 'POST',

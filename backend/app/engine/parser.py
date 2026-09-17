@@ -5,6 +5,7 @@ Gramática soportada (keywords case-insensitive, ';' final opcional)::
     statement   := create_table | create_index | insert | select | delete
                  | load_file | drop_table
     create_table:= CREATE TABLE ident '(' col_def (',' col_def)* ')'
+                   [USING (HEAP | SEQUENTIAL)]
                  | CREATE TABLE ident FROM FILE STRING
     col_def     := ident type [PRIMARY KEY]
     type        := INT | FLOAT | BOOL | TEXT | POINT | VARCHAR '(' num ')'
@@ -37,7 +38,7 @@ KEYWORDS = {
     "CREATE", "TABLE", "PRIMARY", "KEY", "INT", "FLOAT", "VARCHAR", "TEXT",
     "BOOL", "POINT", "INDEX", "ON", "USING", "BTREE", "HASH", "RTREE",
     "INSERT", "INTO", "VALUES", "SELECT", "FROM", "WHERE", "LIMIT",
-    "OFFSET",
+    "OFFSET", "HEAP", "SEQUENTIAL",
     "BETWEEN", "AND", "IN", "KNN", "DELETE", "TRUE", "FALSE",
     "FILE", "LOAD", "DROP",
     "COUNT", "MIN", "MAX", "SUM", "AVG",
@@ -205,11 +206,15 @@ class Parser:
             self.advance()
             columns.append(self._parse_col_def())
         self.expect_punct(")")
+        organization = "heap"
+        if self.accept_kw("USING"):
+            organization = self.expect_kw("HEAP", "SEQUENTIAL").value.lower()
         pk = [c["name"] for c in columns if c["primary_key"]]
         if len(pk) > 1:
             raise ParseError("solo se permite una PRIMARY KEY por tabla",
                              self.peek().pos)
-        return {"type": "create_table", "table": name, "columns": columns}
+        return {"type": "create_table", "table": name, "columns": columns,
+                "organization": organization}
 
     def _parse_col_def(self) -> dict:
         name = self.expect_ident()

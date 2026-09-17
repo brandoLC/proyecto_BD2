@@ -17,7 +17,9 @@ from typing import Callable
 from ..indexes.btree import BPlusTree
 from ..indexes.extendible_hash import ExtendibleHash
 from ..indexes.rtree import RTree
+from ..storage.disk_counter import DiskCounter
 from ..storage.heap_file import HeapFile
+from ..storage.sequential_file import SequentialFile
 from ..storage.record import (
     Column,
     SerializationError,
@@ -103,6 +105,8 @@ class Engine:
         self.catalog = Catalog(data_dir)
         self._auto_cache: dict[str, int] = {}  # siguiente valor por tabla
         self._seq_dirty: set[str] = set()
+        # Contador de I/O de la consulta en curso (None fuera de execute).
+        self._counter: DiskCounter | None = None
 
     # ------------------------------------------------------------------
     # Archivos e índices
@@ -116,7 +120,52 @@ class Engine:
         )
 
     def _open_heap(self, table: str, create: bool = False) -> HeapFile:
-        return HeapFile(self._heap_path(table), create=create)
+        return HeapFile(self._heap_path(table), create=create,
+                        counter=self._counter)
+
+    def _seq_paths(self, table: str) -> tuple[str, str]:
+        return (os.path.join(self.data_dir, f"{table}.seq"),
+                os.path.join(self.data_dir, f"{table}.ovf"))
+
+    def _is_sequential(self, table: str) -> bool:
+        return self.catalog.organization(table) == "sequential"
+
+    def _open_sequential(self, table: str, pk: Column,
+                         create: bool = False) -> SequentialFile:
+        seq_path, ovf_path = self._seq_paths(table)
+        return SequentialFile(
+            seq_path, ovf_path,
+            key_size(pk),
+            lambda v: encode_key(v, pk),
+            lambda b: decode_key(b, pk),
+            create=create,
+            counter=self._counter,
+        )
+
+    def _open_storage(self, table: str, create: bool = False):
+        """Archivo de datos de la tabla: HeapFile o SequentialFile según
+        su organización en el catálogo."""
+        if self._is_sequential(table):
+            return self._open_sequential(
+                table, self.catalog.primary_key(table), create=create)
+        return self._open_heap(table, create=create)
+
+    @staticmethod
+    def _scan_rows(storage):
+        """Itera ``(rid, record_bytes)`` uniforme sobre HeapFile y
+        SequentialFile (cuyo scan también devuelve la clave)."""
+        if isinstance(storage, SequentialFile):
+            for rid, _key, raw in storage.scan():
+                yield rid, raw
+        else:
+            yield from storage.scan()
+
+    @staticmethod
+    def _read_row(storage, rid) -> bytes:
+        """Registro crudo del RID, uniforme para ambas organizaciones."""
+        if isinstance(storage, SequentialFile):
+            return storage.read(rid)[1]
+        return storage.read(rid)
 
     def _open_btree(self, table: str, col: Column,
                     create: bool = False) -> BPlusTree:
@@ -126,6 +175,7 @@ class Engine:
             lambda v: encode_key(v, col),
             lambda b: decode_key(b, col),
             create=create,
+            counter=self._counter,
         )
 
     def _open_hash(self, table: str, col: Column,
@@ -136,11 +186,13 @@ class Engine:
             lambda v: encode_key(v, col),
             lambda b: decode_key(b, col),
             create=create,
+            counter=self._counter,
         )
 
     def _open_rtree(self, table: str, col: Column,
                     create: bool = False) -> RTree:
-        return RTree(self._index_path(table, col.name, "RTREE"), create=create)
+        return RTree(self._index_path(table, col.name, "RTREE"),
+                     create=create, counter=self._counter)
 
     # ------------------------------------------------------------------
     # Entrada principal
@@ -149,28 +201,35 @@ class Engine:
         """Ejecuta una sentencia SQL y devuelve el resultado del contrato."""
         start = time.perf_counter()
         plan = _Plan()
+        # Contador de I/O fresco por consulta: las estructuras abiertas
+        # durante el dispatch envuelven sus archivos con CountedFile.
+        self._counter = DiskCounter()
         try:
-            t = time.perf_counter()
-            ast = parse(sql)
-            plan.add("Parse SQL", f"AST: {ast['type']}", t)
-        except ParseError as exc:
-            return {"ok": False, "error": str(exc), "stage": "parse"}
+            try:
+                t = time.perf_counter()
+                ast = parse(sql)
+                plan.add("Parse SQL", f"AST: {ast['type']}", t)
+            except ParseError as exc:
+                return {"ok": False, "error": str(exc), "stage": "parse"}
 
-        try:
-            result = self._dispatch(ast, plan)
-        except SemanticError as exc:
-            return {"ok": False, "error": str(exc), "stage": "semantic"}
-        except SerializationError as exc:
-            return {"ok": False, "error": str(exc), "stage": "semantic"}
-        except (ExecutionError, KeyError, ValueError) as exc:
-            return {"ok": False, "error": str(exc), "stage": "execution"}
+            try:
+                result = self._dispatch(ast, plan)
+            except SemanticError as exc:
+                return {"ok": False, "error": str(exc), "stage": "semantic"}
+            except SerializationError as exc:
+                return {"ok": False, "error": str(exc), "stage": "semantic"}
+            except (ExecutionError, KeyError, ValueError) as exc:
+                return {"ok": False, "error": str(exc), "stage": "execution"}
+            finally:
+                self._flush_seq()
+
+            result["ok"] = True
+            result["plan"] = plan.steps
+            result["elapsed_ms"] = _ms(start)
+            result["io"] = self._counter.snapshot()
+            return result
         finally:
-            self._flush_seq()
-
-        result["ok"] = True
-        result["plan"] = plan.steps
-        result["elapsed_ms"] = _ms(start)
-        return result
+            self._counter = None
 
     def _dispatch(self, ast: dict, plan: _Plan) -> dict:
         kind = ast["type"]
@@ -203,7 +262,10 @@ class Engine:
         plan.add("Semantic Check", f"'{table}' existe", t)
 
         t = time.perf_counter()
-        paths = [self._heap_path(table)]
+        if self._is_sequential(table):
+            paths = list(self._seq_paths(table))
+        else:
+            paths = [self._heap_path(table)]
         for meta in self.catalog.indexes(table):
             paths.append(self._index_path(table, meta["column"],
                                           meta["type"]))
@@ -287,17 +349,31 @@ class Engine:
             raise SemanticError("columnas con nombre duplicado")
         columns = self._with_implicit_pk(columns)
         auto_pk = next((c.name for c in columns if c.auto), None)
+        organization = ast.get("organization", "heap")
+        pk_col = next(c for c in columns if c.primary_key)
+        if organization == "sequential" and pk_col.type == TYPE_POINT:
+            raise SemanticError(
+                "la PK de una tabla SEQUENTIAL no puede ser POINT")
         plan.add("Semantic Check", f"esquema de '{table}' válido"
                  + (f" (PK implícita {auto_pk} SERIAL)"
-                    if auto_pk else ""), t)
+                    if auto_pk else "")
+                 + (f", organización {organization.upper()}"
+                    if organization != "heap" else ""), t)
 
         t = time.perf_counter()
-        heap = self._open_heap(table, create=True)
-        heap.close()
-        plan.add("Create Heap File", os.path.basename(self._heap_path(table)), t)
+        if organization == "sequential":
+            storage = self._open_sequential(table, pk_col, create=True)
+            storage.close()
+            plan.add("Create Sequential File",
+                     os.path.basename(self._seq_paths(table)[0]), t)
+        else:
+            heap = self._open_heap(table, create=True)
+            heap.close()
+            plan.add("Create Heap File",
+                     os.path.basename(self._heap_path(table)), t)
 
         t = time.perf_counter()
-        self.catalog.create_table(table, columns)
+        self.catalog.create_table(table, columns, organization=organization)
         plan.add("Update Catalog", "catalog.json persistido", t)
         self._create_pk_index(table, columns, plan)
         return {"kind": "create_table", "table": table,
@@ -309,9 +385,13 @@ class Engine:
 
         Igual que PostgreSQL, toda PK lleva su índice; además evita que la
         verificación de unicidad en INSERT degrade a un escaneo O(n) por fila.
+        Excepción: en tablas SEQUENTIAL el propio archivo ordenado es la vía
+        de acceso de la PK, así que no se genera índice.
         """
         pk = next((c for c in columns if c.primary_key), None)
         if pk is None or pk.type == TYPE_POINT:
+            return
+        if self.catalog.organization(table) == "sequential":
             return
         t = time.perf_counter()
         idx = self._open_btree(table, pk, create=True)
@@ -484,12 +564,19 @@ class Engine:
         if self.catalog.index_on(table, col_name, {itype}):
             raise SemanticError(
                 f"ya existe un índice {itype} sobre {table}.{col_name}")
+        pk = self.catalog.primary_key(table)
+        if (self._is_sequential(table) and pk is not None
+                and col_name == pk.name and itype in ("BTREE", "HASH")):
+            raise SemanticError(
+                f"la PK de una tabla SEQUENTIAL ya es la vía de acceso "
+                f"ordenada: no se permite CREATE INDEX {itype} sobre "
+                f"{table}.{col_name}")
         idx_name = ast["name"] or f"{table}_{col_name}_{itype.lower()}"
         plan.add("Semantic Check",
                  f"{itype} sobre {table}.{col_name} es válido", t)
 
         t = time.perf_counter()
-        heap = self._open_heap(table)
+        heap = self._open_storage(table)
         if itype == "BTREE":
             idx = self._open_btree(table, col, create=True)
         elif itype == "HASH":
@@ -506,7 +593,7 @@ class Engine:
         if hasattr(idx, "defer_flush"):  # BPlusTree/RTree/ExtendibleHash
             idx.defer_flush = True
         n = 0
-        for rid, raw in heap.scan():
+        for rid, raw in self._scan_rows(heap):
             row = deserialize_row(self.catalog.columns(table), raw)
             value = row[col_pos]
             if itype == "RTREE":
@@ -550,12 +637,13 @@ class Engine:
 
     def _insert_row(self, table: str, columns: list[Column], row: list,
                     plan: _Plan | None = None) -> RID:
-        """Inserta una fila validada manteniendo heap file e índices.
+        """Inserta una fila validada manteniendo el archivo de datos e índices.
 
-        Verifica la unicidad de la PRIMARY KEY (índice si existe, si no
-        escaneo secuencial). La columna ``auto`` (PK implícita SERIAL)
-        recibe un entero creciente cuando el valor es ``None``; un valor
-        explícito se respeta y adelanta la secuencia. Devuelve el RID.
+        Verifica la unicidad de la PRIMARY KEY (índice si existe, búsqueda
+        binaria en tablas SEQUENTIAL, si no escaneo secuencial). La columna
+        ``auto`` (PK implícita SERIAL) recibe un entero creciente cuando el
+        valor es ``None``; un valor explícito se respeta y adelanta la
+        secuencia. Devuelve el RID.
         """
         pk = self.catalog.primary_key(table)
         if pk is not None:
@@ -567,6 +655,9 @@ class Engine:
                 else:
                     self._bump_auto_seq(table, row[pk_pos])
             value = row[pk_pos]
+            if self._is_sequential(table):
+                return self._insert_row_sequential(
+                    table, columns, row, pk, value, plan)
             idx_meta = self.catalog.index_on(table, pk.name, {"BTREE", "HASH"})
             if idx_meta is not None:
                 idx = (self._open_btree(table, pk) if idx_meta["type"] == "BTREE"
@@ -577,7 +668,7 @@ class Engine:
                     plan.add("Index Lookup",
                              f"USING {idx_meta['type']} ON {table}.{pk.name}", t)
             else:
-                heap = self._open_heap(table)
+                heap = self._open_storage(table)
                 found = []
                 for rid, raw in heap.scan():
                     if deserialize_row(columns, raw)[pk_pos] == value:
@@ -591,12 +682,40 @@ class Engine:
                     f"clave primaria duplicada: {pk.name} = {value!r}")
 
         t = time.perf_counter()
-        heap = self._open_heap(table)
+        heap = self._open_storage(table)
         rid = heap.insert(serialize_row(columns, row))
         heap.close()
         if plan is not None:
             plan.add("Heap Insert", f"RID = ({rid[0]}, {rid[1]})", t)
 
+        self._index_insert_all(table, columns, row, rid, plan)
+        return rid
+
+    def _insert_row_sequential(self, table: str, columns: list[Column],
+                               row: list, pk: Column, value,
+                               plan: _Plan | None) -> RID:
+        """INSERT en tabla SEQUENTIAL: unicidad por búsqueda binaria e
+        inserción en el archivo ordenado (overflow + reenlace)."""
+        t = time.perf_counter()
+        storage = self._open_storage(table)
+        if storage.search(value) is not None:
+            storage.close()
+            raise ExecutionError(
+                f"clave primaria duplicada: {pk.name} = {value!r}")
+        if plan is not None:
+            plan.add("Binary Search (Sequential)",
+                     f"unicidad de {table}.{pk.name}", t)
+        t = time.perf_counter()
+        rid = storage.insert(value, serialize_row(columns, row))
+        storage.close()
+        if plan is not None:
+            plan.add("Sequential Insert", f"RID = ({rid[0]}, {rid[1]})", t)
+        self._index_insert_all(table, columns, row, rid, plan)
+        return rid
+
+    def _index_insert_all(self, table: str, columns: list[Column], row: list,
+                          rid: RID, plan: _Plan | None) -> None:
+        """Mantiene los índices secundarios tras insertar una fila."""
         for meta in self.catalog.indexes(table):
             t = time.perf_counter()
             col = self._get_column(table, meta["column"])
@@ -613,7 +732,6 @@ class Engine:
             if plan is not None:
                 plan.add("Index Maintenance",
                          f"{meta['type']} ON {table}.{col.name} actualizado", t)
-        return rid
 
     def _open_index(self, table: str, itype: str, col: Column):
         """Abre el índice ``itype`` de ``table`` sobre la columna ``col``."""
@@ -654,9 +772,10 @@ class Engine:
         pk_pos = ([c.name for c in columns].index(pk.name)
                   if pk is not None else None)
 
-        heap = self._open_heap(table)
+        heap = self._open_storage(table)
         heap.defer_header = True
         heap.defer_flush = True
+        sequential = isinstance(heap, SequentialFile)
         col_names = [c.name for c in columns]
         idx_entries: list[tuple[dict, Column, int, object]] = []
         for meta in self.catalog.indexes(table):
@@ -675,7 +794,10 @@ class Engine:
         pk_seen: set | None = None
         if pk is not None and len(rows) >= _BULK_PK_SET_MIN:
             pk_seen = set()
-            if pk_idx is not None and pk_idx[0]["type"] == "BTREE":
+            if sequential:
+                for _rid, key, _raw in heap.scan():
+                    pk_seen.add(key)
+            elif pk_idx is not None and pk_idx[0]["type"] == "BTREE":
                 for key, _rid in pk_idx[3].range_search():
                     pk_seen.add(key)
             else:  # HASH sin recorrido, o PK sin índice: una pasada al heap
@@ -721,6 +843,8 @@ class Engine:
                         value = row[pk_pos]
                         if pk_seen is not None:
                             duplicate = value in pk_seen
+                        elif sequential:
+                            duplicate = heap.search(value) is not None
                         elif pk_idx is not None:
                             duplicate = bool(pk_idx[3].search(value))
                         else:
@@ -733,7 +857,11 @@ class Engine:
                                 f"{pk.name} = {value!r}")
                         if pk_seen is not None:
                             pk_seen.add(value)
-                    rid = heap.insert(serialize_row(columns, row))
+                    if sequential:
+                        rid = heap.insert(row[pk_pos],
+                                          serialize_row(columns, row))
+                    else:
+                        rid = heap.insert(serialize_row(columns, row))
                     for _meta, col, col_pos, idx in idx_entries:
                         v = row[col_pos]
                         idx.insert(tuple(v) if col.type == TYPE_POINT
@@ -784,7 +912,7 @@ class Engine:
             rids, ordered_knn = self._plan_access(table, where, plan)
 
         t = time.perf_counter()
-        heap = self._open_heap(table)
+        heap = self._open_storage(table)
         limit = ast["limit"]
         offset = ast["offset"] or 0
         # Semántica SQL estándar: saltar las primeras `offset` filas del
@@ -803,7 +931,7 @@ class Engine:
             early_stop = not (
                 where is not None and where["kind"] == "knn")
             rows = []
-            for rid, raw in heap.scan():
+            for rid, raw in self._scan_rows(heap):
                 row = deserialize_row(columns, raw)
                 if where is not None and not self._match(columns, where, row):
                     continue
@@ -827,7 +955,7 @@ class Engine:
         elif ordered_knn is not None:
             by_rid = dict()
             for rid, d in ordered_knn:
-                by_rid[rid] = deserialize_row(columns, heap.read(rid))
+                by_rid[rid] = deserialize_row(columns, self._read_row(heap, rid))
             rows = [(rid, by_rid[rid]) for rid, _ in ordered_knn]
             fetched = len(rows)
             # offset/limit se aplica sobre out_rows tras la proyección.
@@ -839,7 +967,7 @@ class Engine:
                 truncated = len(rids) > SELECT_ROW_CAP
                 rids = rids[:SELECT_ROW_CAP]
             fetched = len(rids)
-            rows = [(rid, deserialize_row(columns, heap.read(rid)))
+            rows = [(rid, deserialize_row(columns, self._read_row(heap, rid)))
                     for rid in rids]
         heap.close()
         plan.add("Fetch Rows", f"{fetched} registros leídos del heap", t)
@@ -933,7 +1061,7 @@ class Engine:
             rids, ordered_knn = self._plan_access(table, where, plan)
 
         t = time.perf_counter()
-        heap = self._open_heap(table)
+        heap = self._open_storage(table)
         # COUNT(*) sin WHERE no necesita deserializar: cuenta registros
         # crudos del scan (con WHERE el _match ya exige deserializar).
         needs_values = any(a["fn"] != "count" for a in aggs)
@@ -945,13 +1073,13 @@ class Engine:
             fetched = len(rids)
             if needs_values:
                 for rid in rids:
-                    row = deserialize_row(columns, heap.read(rid))
+                    row = deserialize_row(columns, self._read_row(heap, rid))
                     count += 1
                     self._accumulate(aggs, acc, row)
             else:
                 count = len(rids)
         else:  # escaneo secuencial
-            for rid, raw in heap.scan():
+            for rid, raw in self._scan_rows(heap):
                 fetched += 1
                 if where is not None:
                     row = deserialize_row(columns, raw)
@@ -1016,6 +1144,12 @@ class Engine:
         """Elige el método de acceso y devuelve RIDs (None = seq scan)."""
         col = self._get_column(table, where["column"])
         kind = where["kind"]
+
+        pk = self.catalog.primary_key(table)
+        if (pk is not None and col.name == pk.name
+                and kind in ("compare", "between")
+                and self._is_sequential(table)):
+            return self._plan_access_sequential(table, pk, where, plan)
 
         if kind == "compare":
             op, value = where["op"], where["value"]
@@ -1107,6 +1241,44 @@ class Engine:
 
         raise ExecutionError(f"condición no soportada: {kind}")
 
+    def _plan_access_sequential(self, table: str, pk: Column, where: dict,
+                                plan: _Plan) -> tuple[list[RID], None]:
+        """Acceso por la PK de una tabla SEQUENTIAL: búsqueda binaria en el
+        área principal + recorrido de la cadena del overflow."""
+        storage = self._open_storage(table)
+        kind = where["kind"]
+        t = time.perf_counter()
+        if kind == "compare":
+            op = where["op"]
+            value = coerce_value(where["value"], pk)
+            if op == "=":
+                found = storage.search(value)
+                rids = [found[0]] if found is not None else []
+                detail = (f"{table}.{pk.name} = {value!r} "
+                          f"-> {len(rids)} RIDs")
+            else:
+                if op == "<":
+                    res = storage.range_search(hi=value, hi_inc=False)
+                elif op == "<=":
+                    res = storage.range_search(hi=value)
+                elif op == ">":
+                    res = storage.range_search(lo=value, lo_inc=False)
+                else:  # ">="
+                    res = storage.range_search(lo=value)
+                rids = [rid for rid, _k, _p in res]
+                detail = (f"{table}.{pk.name} {op} {value!r} "
+                          f"-> {len(rids)} RIDs")
+        else:  # between
+            low = coerce_value(where["low"], pk)
+            high = coerce_value(where["high"], pk)
+            res = storage.range_search(low, high)
+            rids = [rid for rid, _k, _p in res]
+            detail = (f"{table}.{pk.name} BETWEEN {low!r} AND {high!r} "
+                      f"-> {len(rids)} RIDs")
+        storage.close()
+        plan.add("Binary Search (Sequential)", detail, t)
+        return rids, None
+
     # ------------------------------------------------------------------
     # Filtro en escaneo secuencial
     # ------------------------------------------------------------------
@@ -1156,18 +1328,25 @@ class Engine:
         rids, _ = self._plan_access(table, where, plan)
         if rids is None:
             t = time.perf_counter()
-            heap = self._open_heap(table)
-            rids = [rid for rid, raw in heap.scan()
+            heap = self._open_storage(table)
+            rids = [rid for rid, raw in self._scan_rows(heap)
                     if self._match(columns, where, deserialize_row(columns, raw))]
             heap.close()
             plan.add("Filter", f"{len(rids)} registros coinciden", t)
 
         t = time.perf_counter()
-        heap = self._open_heap(table)
-        victims = [(rid, deserialize_row(columns, heap.read(rid)))
+        heap = self._open_storage(table)
+        victims = [(rid, deserialize_row(columns, self._read_row(heap, rid)))
                    for rid in rids]
-        for rid, _ in victims:
-            heap.delete(rid)
+        if isinstance(heap, SequentialFile):
+            # El SequentialFile elimina por clave (la PK de la fila).
+            pk_col = self.catalog.primary_key(table)
+            pk_pos = [c.name for c in columns].index(pk_col.name)
+            for _rid, row in victims:
+                heap.delete(row[pk_pos])
+        else:
+            for rid, _ in victims:
+                heap.delete(rid)
         heap.close()
         plan.add("Heap Delete", f"{len(victims)} registros eliminados", t)
 
@@ -1218,15 +1397,21 @@ class Engine:
         out = []
         for name in self.catalog.table_names():
             columns = self.catalog.columns(name)
-            heap = self._open_heap(name)
+            organization = self.catalog.organization(name)
+            heap = self._open_storage(name)
             rowcount = heap.row_count
             heap.close()
-            files = [self._file_info(self._heap_path(name))]
+            if organization == "sequential":
+                files = [self._file_info(p) for p in self._seq_paths(name)
+                         if os.path.isfile(p)]
+            else:
+                files = [self._file_info(self._heap_path(name))]
             for meta in self.catalog.indexes(name):
                 files.append(self._file_info(
                     self._index_path(name, meta["column"], meta["type"])))
             out.append({
                 "name": name,
+                "organization": organization,
                 "columns": [
                     {"name": c.name, "type": c.type_str(),
                      "primary_key": c.primary_key, "auto": c.auto}
@@ -1241,6 +1426,18 @@ class Engine:
                 "files": files,
             })
         return out
+
+    def reorganize(self, table: str, fill_factor: float = 0.75) -> dict:
+        """Reorganiza el archivo SEQUENTIAL de ``table`` y devuelve stats.
+
+        Uso del endpoint ``POST /api/tables/{name}/reorganize``; la
+        validación de existencia/organización la hace la ruta.
+        """
+        storage = self._open_storage(table)
+        try:
+            return storage.reorganize(fill_factor)
+        finally:
+            storage.close()
 
     @staticmethod
     def _file_info(path: str) -> dict:

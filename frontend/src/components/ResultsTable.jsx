@@ -44,6 +44,7 @@ export default function ResultsTable({ result, tableName, page = 0, pagerActive 
         <p className="mt-1 font-mono text-xs text-helper">
           {result.elapsed_ms?.toFixed?.(1) ?? result.elapsed_ms} ms
           {result.rowcount != null && ` · ${result.rowcount} filas afectadas`}
+          {result.io && ` · I/O: ${result.io.reads} lecturas · ${result.io.writes} escrituras`}
         </p>
       </div>
     )
@@ -69,6 +70,7 @@ export default function ResultsTable({ result, tableName, page = 0, pagerActive 
       <div className="mb-3 flex items-center justify-between gap-2">
         <p className="font-mono text-xs text-helper">
           {rowcount} filas · {result.elapsed_ms?.toFixed?.(1) ?? result.elapsed_ms} ms
+          {result.io && ` · I/O: ${result.io.reads} lecturas · ${result.io.writes} escrituras`}
         </p>
         <button
           type="button"

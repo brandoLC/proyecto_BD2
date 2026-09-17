@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { getHealth, getTables, inferSchema, postQuery, uploadCsv } from './api.js'
+import { getHealth, getTables, inferSchema, postQuery, reorganizeTable, uploadCsv } from './api.js'
 import useTheme from './hooks/useTheme.js'
 import TopNav from './components/TopNav.jsx'
 import Sidebar from './components/Sidebar.jsx'
@@ -90,6 +90,7 @@ export default function App() {
 
   // CSV: resultado/estado de carga por tabla, y estado del asistente "Nuevo desde CSV".
   const [csvUploads, setCsvUploads] = useState({}) // { [tabla]: {loading?, result?, error?} }
+  const [reorgs, setReorgs] = useState({}) // { [tabla]: {loading?, result?, error?} }
   const [infer, setInfer] = useState(null) // null | {loading} | {data} | {error:{error,stage}}
   const [inferModalOpen, setInferModalOpen] = useState(false)
   // Columna POINT derivada por tabla inferida: { [tabla]: {column, lat_col, lng_col} }
@@ -173,6 +174,11 @@ export default function App() {
             // Una tabla recreada/eliminada invalida el mensaje de carga CSV anterior.
             if ((data.kind === 'create_table' || data.kind === 'drop_table') && data.table) {
               setCsvUploads((prev) => {
+                const next = { ...prev }
+                delete next[data.table]
+                return next
+              })
+              setReorgs((prev) => {
                 const next = { ...prev }
                 delete next[data.table]
                 return next
@@ -314,6 +320,38 @@ export default function App() {
     })
   }, [])
 
+  const reorganize = useCallback(
+    async (name) => {
+      setReorgs((prev) => ({ ...prev, [name]: { loading: true } }))
+      try {
+        const data = await reorganizeTable(name)
+        if (data.ok) {
+          setReorgs((prev) => ({ ...prev, [name]: { result: data } }))
+          loadTables() // cambian las páginas/archivos físicos
+        } else {
+          setReorgs((prev) => ({
+            ...prev,
+            [name]: { error: { error: data.error || 'Error desconocido', stage: data.stage } },
+          }))
+        }
+      } catch (e) {
+        setReorgs((prev) => ({
+          ...prev,
+          [name]: { error: { error: `Error de red: ${e.message}`, stage: null } },
+        }))
+      }
+    },
+    [loadTables],
+  )
+
+  const dismissReorg = useCallback((name) => {
+    setReorgs((prev) => {
+      const next = { ...prev }
+      delete next[name]
+      return next
+    })
+  }, [])
+
   return (
     <div className="min-h-screen bg-canvas">
       <TopNav
@@ -342,6 +380,9 @@ export default function App() {
               csvUploads={csvUploads}
               onUploadCsv={uploadCsvToTable}
               onDismissCsv={dismissCsv}
+              reorgs={reorgs}
+              onReorganize={reorganize}
+              onDismissReorg={dismissReorg}
               infer={infer}
               onInfer={inferFromCsv}
               onClearInfer={() => {
