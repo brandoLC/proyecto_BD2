@@ -5,10 +5,10 @@ services:
     container_name: minidb-backend
     environment:
       DATA_DIR: /data
-      DATASETS_DIR: /datasets
+      CSV_DIR: /csv
     volumes:
       - minidb-data:/data
-      - ./datasets:/datasets:z
+      - ./data:/csv:z
     ports:
       - "8000:8000"
 

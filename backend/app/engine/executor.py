@@ -406,15 +406,15 @@ class Engine:
     def _read_dataset_csv(self, filename: str) -> tuple[list[str],
                                                         list[tuple[int,
                                                               list[str]]]]:
-        """Lee un CSV de ``DATASETS_DIR`` (defecto ``./datasets``)."""
+        """Lee un CSV de ``CSV_DIR`` (defecto ``./data``)."""
         try:
             path = resolve_dataset_path(
-                os.environ.get("DATASETS_DIR", "./datasets"), filename)
+                os.environ.get("CSV_DIR", "./data"), filename)
         except ValueError as exc:
             raise SemanticError(str(exc)) from exc
         if not os.path.isfile(path):
             raise ExecutionError(
-                f"el archivo '{filename}' no existe en DATASETS_DIR")
+                f"el archivo '{filename}' no existe en CSV_DIR")
         with open(path, "rb") as f:
             text = decode_csv_bytes(f.read())
         try:

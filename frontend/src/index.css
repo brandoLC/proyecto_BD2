@@ -67,6 +67,34 @@ h3,
   font-weight: 500;
 }
 
+/* Resaltado de sintaxis SQL (capa <pre> detrás del textarea del editor) */
+.tok-keyword {
+  color: #1d7fd6;
+  font-weight: 500;
+}
+.tok-string {
+  color: #15803d;
+}
+.tok-number {
+  color: #c2410c;
+}
+.tok-comment {
+  color: var(--color-helper);
+  font-style: italic;
+}
+.tok-operator {
+  color: var(--color-body);
+}
+.dark .tok-keyword {
+  color: #6ec3ff;
+}
+.dark .tok-string {
+  color: #4ade80;
+}
+.dark .tok-number {
+  color: #fb923c;
+}
+
 /* Leaflet: que el mapa no herede estilos raros dentro de tarjetas */
 .leaflet-container {
   font-family: var(--font-sans);

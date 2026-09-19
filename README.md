@@ -58,10 +58,10 @@ Tres formas de cargar datos masivamente:
    sugerido para que lo revises y ejecutes.
 3. **Desde SQL**: `CREATE TABLE t FROM FILE "archivo.csv";` (infiere el esquema
    y carga) o `LOAD INTO t FROM FILE "archivo.csv";` (tabla existente). Los
-   archivos se leen de la carpeta `./datasets` (montada en el backend).
+   archivos se leen de la carpeta `./data` (montada en el backend).
 
 Convención: el CSV lleva header con los nombres de columna y los puntos se
-escriben entre comillas como `"(lat, lon)"`. Ver `datasets/` para ejemplos.
+escriben entre comillas como `"(lat, lon)"`. Ver `data/` para ejemplos.
 
 ## Desarrollo local (sin Docker)
 

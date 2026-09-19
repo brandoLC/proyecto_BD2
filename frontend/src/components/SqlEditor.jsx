@@ -1,5 +1,51 @@
 // Editor SQL con botón Ejecutar (Ctrl+Enter), Limpiar, consultas de
 // ejemplo y dropdown de historial (últimas consultas exitosas).
+// Resaltado de sintaxis: <pre> con spans coloreados (.tok-*) detrás del
+// textarea (texto transparente, caret visible), scroll sincronizado.
+import { useMemo, useRef } from 'react'
+
+const KEYWORDS = new Set([
+  'SELECT', 'FROM', 'WHERE', 'CREATE', 'TABLE', 'INDEX', 'USING', 'BTREE',
+  'HASH', 'RTREE', 'HEAP', 'SEQUENTIAL', 'INSERT', 'INTO', 'VALUES',
+  'DELETE', 'DROP', 'LOAD', 'FILE', 'KNN', 'IN', 'BETWEEN', 'AND', 'LIMIT',
+  'OFFSET', 'COUNT', 'MIN', 'MAX', 'SUM', 'AVG', 'PRIMARY', 'KEY', 'INT',
+  'FLOAT', 'VARCHAR', 'TEXT', 'BOOL', 'POINT', 'TRUE', 'FALSE', 'SERIAL',
+])
+
+// Tokenizer del dialecto MiniDB. Orden de alternancia: comentario,
+// strings (simples y dobles, con escape por duplicado), números,
+// palabras (keyword o identificador) y operadores/puntuación.
+const TOKEN_RE =
+  /(--[^\n]*)|('(?:[^']|'')*')|("(?:[^"]|"")*")|(\d+(?:\.\d+)?)|([A-Za-z_][A-Za-z0-9_]*)|(<=|>=|<>|!=|=|<|>|\+|-|\*|\/|%|\(|\)|,|;|\.)/g
+
+function highlightSql(sql) {
+  const nodes = []
+  let last = 0
+  let key = 0
+  TOKEN_RE.lastIndex = 0
+  let m
+  while ((m = TOKEN_RE.exec(sql))) {
+    if (m.index > last) nodes.push(sql.slice(last, m.index))
+    const [full, comment, sq, dq, num, word, op] = m
+    if (comment) nodes.push(<span key={key++} className="tok-comment">{comment}</span>)
+    else if (sq || dq) nodes.push(<span key={key++} className="tok-string">{sq || dq}</span>)
+    else if (num) nodes.push(<span key={key++} className="tok-number">{num}</span>)
+    else if (word) {
+      if (KEYWORDS.has(word.toUpperCase())) {
+        nodes.push(<span key={key++} className="tok-keyword">{word}</span>)
+      } else {
+        nodes.push(word)
+      }
+    } else if (op) nodes.push(<span key={key++} className="tok-operator">{op}</span>)
+    last = m.index + full.length
+  }
+  if (last < sql.length) nodes.push(sql.slice(last))
+  // Si el texto termina en salto de línea, el textarea muestra una línea
+  // vacía final que el <pre> colapsa; el espacio extra mantiene la misma
+  // altura para que el scroll no se desalinee.
+  if (sql.endsWith('\n')) nodes.push(' ')
+  return nodes
+}
 const EXAMPLES = [
   {
     label: 'KNN: 5 restaurantes cerca de (-76.8, 39.2)',
@@ -37,6 +83,18 @@ function shortLabel(q) {
 }
 
 export default function SqlEditor({ sql, setSql, onExecute, onClear, executing, history = [] }) {
+  const highlightRef = useRef(null)
+  const highlighted = useMemo(() => highlightSql(sql), [sql])
+
+  // El <pre> resaltado está detrás y no scrollea solo; se arrastra con el
+  // scroll del textarea para que ambas capas queden alineadas.
+  const syncScroll = (e) => {
+    const pre = highlightRef.current
+    if (!pre) return
+    pre.scrollTop = e.target.scrollTop
+    pre.scrollLeft = e.target.scrollLeft
+  }
+
   const handleKeyDown = (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault()
@@ -98,15 +156,28 @@ export default function SqlEditor({ sql, setSql, onExecute, onClear, executing, 
         </div>
       </div>
 
-      <textarea
-        value={sql}
-        onChange={(e) => setSql(e.target.value)}
-        onKeyDown={handleKeyDown}
-        rows={10}
-        spellCheck={false}
-        placeholder="Escribe tu consulta SQL aquí…  (Ctrl+Enter para ejecutar)"
-        className="w-full resize-y rounded-input border border-hairline bg-canvas/50 p-4 font-mono text-[13px] leading-relaxed text-ink outline-none placeholder:text-helper focus:border-border-strong"
-      />
+      <div className="relative rounded-input bg-canvas/50">
+        {/* Capa de resaltado: mismo font/padding que el textarea, detrás
+            (el textarea define el tamaño y conserva su resize-y). inset-px
+            deja libre el borde de 1px del textarea. */}
+        <pre
+          ref={highlightRef}
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-px overflow-hidden whitespace-pre-wrap break-words p-4 font-mono text-[13px] leading-relaxed text-ink"
+        >
+          {highlighted}
+        </pre>
+        <textarea
+          value={sql}
+          onChange={(e) => setSql(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onScroll={syncScroll}
+          rows={10}
+          spellCheck={false}
+          placeholder="Escribe tu consulta SQL aquí…  (Ctrl+Enter para ejecutar)"
+          className="relative w-full resize-y rounded-input border border-hairline bg-transparent p-4 font-mono text-[13px] leading-relaxed text-transparent caret-ink outline-none placeholder:text-helper focus:border-border-strong"
+        />
+      </div>
 
       <div className="mt-4 flex items-center gap-3">
         <button

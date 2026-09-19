@@ -7,12 +7,14 @@ import SqlEditor from './components/SqlEditor.jsx'
 import StatusMessage from './components/StatusMessage.jsx'
 import ResultsTable, { PAGE_SIZE } from './components/ResultsTable.jsx'
 import PlanPanel from './components/PlanPanel.jsx'
+import IoHistoryChart, { extractAccessType } from './components/IoHistoryChart.jsx'
 import MapPanel from './components/MapPanel.jsx'
 import InferSchemaModal from './components/InferSchemaModal.jsx'
 
-const TABS = ['Resultados', 'Plan', 'Mapa']
+const TABS = ['Resultados', 'Plan', 'Métricas', 'Mapa']
 const HISTORY_KEY = 'minidb:history'
 const HISTORY_MAX = 20
+const IO_HISTORY_MAX = 10
 const SIDEBAR_KEY = 'minidb:sidebar'
 
 // Genera el CREATE TABLE en el editor a partir de la inferencia, con la
@@ -78,6 +80,9 @@ export default function App() {
   const [lastTable, setLastTable] = useState(null) // tabla de la consulta que produjo `result`
   const [activeTable, setActiveTable] = useState(null) // breadcrumb + nodo activo del árbol
   const [history, setHistory] = useState(loadHistory) // últimas consultas exitosas
+  // Historial de métricas I/O para el visor del PlanPanel: solo en estado
+  // (la sesión basta), últimas IO_HISTORY_MAX consultas exitosas del editor.
+  const [ioHistory, setIoHistory] = useState([])
   const [sidebarOpen, setSidebarOpen] = useState(loadSidebarOpen)
   const [tab, setTab] = useState('Resultados')
 
@@ -154,6 +159,18 @@ export default function App() {
             setLastSql(query)
             const name = extractTableName(query)
             setLastTable(name)
+            // Visor de I/O: se registran solo las consultas del editor
+            // (recordHistory, página 0); las páginas LIMIT/OFFSET del
+            // pager son reejecuciones de la misma consulta y no cuentan.
+            if (data.io) {
+              const entry = {
+                sql: query,
+                access: extractAccessType(data.plan, data.kind),
+                reads: data.io.reads,
+                writes: data.io.writes,
+              }
+              setIoHistory((prev) => [entry, ...prev].slice(0, IO_HISTORY_MAX))
+            }
             // Historial: sin duplicados consecutivos, tope HISTORY_MAX.
             setHistory((prev) => {
               const next = (prev[0] === query ? prev : [query, ...prev]).slice(0, HISTORY_MAX)
@@ -459,6 +476,14 @@ export default function App() {
                 />
               )}
               {tab === 'Plan' && <PlanPanel result={result} />}
+              {tab === 'Métricas' &&
+                (ioHistory.length === 0 ? (
+                  <p className="py-10 text-center text-xs text-helper">
+                    Ejecuta consultas para ver métricas I/O.
+                  </p>
+                ) : (
+                  <IoHistoryChart entries={ioHistory} />
+                ))}
               {tab === 'Mapa' && <MapPanel result={result} sql={lastSql} theme={theme} />}
             </section>
           </div>

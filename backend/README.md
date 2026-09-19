@@ -123,7 +123,7 @@ Convenciones del formato:
   que aparezcan más abajo. Si la primera columna es `INT` con valores
   únicos se sugiere como `PRIMARY KEY`.
 - Los archivos de `FROM FILE` se resuelven dentro de `DATASETS_DIR`
-  (por defecto `./datasets`); se rechazan rutas absolutas y con `..`.
+  (por defecto `./data`); se rechazan rutas absolutas y con `..`.
 - **Manejo de errores por fila**: las filas inválidas se *rechazan* sin
   abortar la carga y se reportan con su número de línea (cabecera =
   línea 1) y el motivo; se conservan hasta 50 errores. Las columnas del

@@ -421,14 +421,14 @@ def cast_csv_value(raw: str, col: Column):
     return result
 
 
-def resolve_dataset_path(datasets_dir: str, filename: str) -> str:
-    """Resuelve ``filename`` dentro de ``datasets_dir`` rechazando
+def resolve_dataset_path(csv_dir: str, filename: str) -> str:
+    """Resuelve ``filename`` dentro de ``csv_dir`` rechazando
     rutas absolutas y traversal (``..``). Devuelve la ruta absoluta."""
     if os.path.isabs(filename):
         raise ValueError(f"ruta absoluta no permitida: '{filename}'")
-    base = os.path.realpath(datasets_dir)
+    base = os.path.realpath(csv_dir)
     path = os.path.realpath(os.path.join(base, filename))
     if path != base and os.path.commonpath([base, path]) != base:
-        raise ValueError(f"ruta fuera del directorio de datasets: "
+        raise ValueError(f"ruta fuera del directorio de CSVs: "
                          f"'{filename}'")
     return path

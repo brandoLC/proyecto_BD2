@@ -655,9 +655,9 @@ class TestUploadCSVDerivedPoint:
 # ----------------------------------------------------------------------
 @pytest.fixture()
 def engine_ds(tmp_path, monkeypatch):
-    ds = tmp_path / "datasets"
+    ds = tmp_path / "csv"
     ds.mkdir()
-    monkeypatch.setenv("DATASETS_DIR", str(ds))
+    monkeypatch.setenv("CSV_DIR", str(ds))
     return Engine(str(tmp_path / "data")), ds
 
 
