@@ -105,3 +105,54 @@ class TestBPlusTree:
                 assert t.search(k) == [(i, 2)]
             assert set(t.range_search(0, 100)) == {
                 (i, 2) for i, k in enumerate(keys) if 0 <= k <= 100}
+
+
+class TestPageSizeYAltura:
+    """``page_size`` parametrizable (experimento de tamaño de bloque) y
+    el método público ``height()``."""
+
+    ENC = staticmethod(lambda v: struct.pack("<i", v))
+    DEC = staticmethod(lambda b: struct.unpack("<i", b)[0])
+
+    def test_pagina_mas_chica_reduce_capacidades(self, tmp_path):
+        with make_tree(tmp_path, key_size=4) as big:
+            cap_hoja_4k, cap_int_4k = big.leaf_cap, big.internal_cap
+        with BPlusTree(str(tmp_path / "t1k.btree"), 4, self.ENC, self.DEC,
+                       create=True, page_size=1024) as small:
+            assert small.leaf_cap < cap_hoja_4k
+            assert small.internal_cap < cap_int_4k
+            # (1024 - header) // (key + rid) para hoja de claves INT
+            assert small.leaf_cap == (1024 - 7) // (4 + 6)
+
+    def test_insertar_buscar_y_reabrir_con_otro_page_size(self, tmp_path):
+        rng = random.Random(7)
+        keys = rng.sample(range(5000), 500)
+        path = str(tmp_path / "t2k.btree")
+        with BPlusTree(path, 4, self.ENC, self.DEC,
+                       create=True, page_size=2048) as t:
+            for i, k in enumerate(keys):
+                t.insert(k, (i, 0))
+            for i, k in enumerate(keys):
+                assert t.search(k) == [(i, 0)]
+        with BPlusTree(path, 4, self.ENC, self.DEC, page_size=2048) as t:
+            for i, k in enumerate(keys):
+                assert t.search(k) == [(i, 0)]
+            assert t.height() >= 2
+
+    def test_page_size_invalido(self, tmp_path):
+        with pytest.raises(ValueError):
+            BPlusTree(str(tmp_path / "x.btree"), 4, self.ENC, self.DEC,
+                      create=True, page_size=8)
+
+    def test_height(self, tmp_path):
+        with make_tree(tmp_path) as t:
+            assert t.height() == 1  # solo la raíz hoja
+            for i in range(5000):
+                t.insert(i, (i, 0))
+            h = t.height()
+            # 5000 claves INT ordenadas en 4 KB: ~13 hojas llenas bajo
+            # una raíz interna (hoja_cap=408, interno_cap=292).
+            assert h == 2
+            # altura = niveles del camino raíz->hoja; consistente con
+            # que una búsqueda lee exactamente h páginas de nodos.
+            assert t.search(4999) == [(4999, 0)]

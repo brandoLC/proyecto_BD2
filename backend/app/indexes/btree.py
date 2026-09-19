@@ -1,4 +1,8 @@
-"""B+ Tree persistido en su propio archivo de páginas de 4 KB.
+"""B+ Tree persistido en su propio archivo de páginas (4 KB por defecto).
+
+El tamaño de página es configurable por instancia (``page_size``) para
+experimentos de sensibilidad al tamaño de bloque; el resto del motor
+(heap, sequential file, hash, R-Tree) sigue fijo en 4 KB.
 
 Estructura del archivo:
 
@@ -78,11 +82,19 @@ class BPlusTree:
         decode,
         create: bool = False,
         counter: DiskCounter | None = None,
+        page_size: int = PAGE_SIZE,
     ) -> None:
         self.path = path
         self.key_size = key_size
         self.encode = encode
         self.decode = decode
+        # Tamaño de página del archivo. El default es PAGE_SIZE (4 KB);
+        # se puede sobreescribir para experimentos de sensibilidad al
+        # tamaño de bloque (benchmarks/exp4_bloque.py). No viaja en la
+        # cabecera: al reabrir un archivo hay que pasar el mismo valor.
+        if page_size < 64:
+            raise ValueError(f"page_size demasiado pequeño: {page_size}")
+        self.page_size = page_size
         # Modo de carga masiva: con ``defer_header`` la cabecera se vuelca
         # una sola vez al final (``flush_header``/``close``) en vez de en
         # cada inserción.
@@ -105,10 +117,12 @@ class BPlusTree:
         self.defer_flush = False
         self._pending: dict[int, object] = {}
         self._pending_max = 4096
-        # Capacidades calculadas para que un nodo quepa en 4 KB.
-        self.leaf_cap = max(2, (PAGE_SIZE - LEAF_HEADER_SIZE) // (key_size + RID_SIZE))
+        # Capacidades calculadas para que un nodo quepa en una página.
+        self.leaf_cap = max(
+            2, (self.page_size - LEAF_HEADER_SIZE) // (key_size + RID_SIZE)
+        )
         self.internal_cap = max(
-            2, (PAGE_SIZE - INTERNAL_HEADER_SIZE - 4) // (key_size + RID_SIZE + 4)
+            2, (self.page_size - INTERNAL_HEADER_SIZE - 4) // (key_size + RID_SIZE + 4)
         )
         if create or not os.path.exists(path):
             self.root_page = 1
@@ -135,7 +149,7 @@ class BPlusTree:
         self._flush_header()
 
     def _flush_header(self) -> None:
-        buf = bytearray(PAGE_SIZE)
+        buf = bytearray(self.page_size)
         struct.pack_into(
             HEADER_FMT, buf, 0, MAGIC, self.root_page, self.page_count, self.key_size
         )
@@ -151,8 +165,8 @@ class BPlusTree:
 
     def _read_header(self) -> None:
         self._file.seek(0)
-        data = self._file.read(PAGE_SIZE)
-        if len(data) < PAGE_SIZE or data[:4] != MAGIC:
+        data = self._file.read(self.page_size)
+        if len(data) < self.page_size or data[:4] != MAGIC:
             raise ValueError(f"{self.path} no es un archivo B+ tree válido")
         _, self.root_page, self.page_count, ks = struct.unpack_from(HEADER_FMT, data, 0)
         if ks != self.key_size:
@@ -169,11 +183,11 @@ class BPlusTree:
             # página aún no volcada: se serializa al vuelo (raro: solo si
             # la caché de nodos se vació antes del volcado)
             return self._serialize_node(node)
-        self._file.seek(page_id * PAGE_SIZE)
-        return self._file.read(PAGE_SIZE)
+        self._file.seek(page_id * self.page_size)
+        return self._file.read(self.page_size)
 
     def _write_raw(self, page_id: int, data: bytes) -> None:
-        self._file.seek(page_id * PAGE_SIZE)
+        self._file.seek(page_id * self.page_size)
         self._file.write(data)
         self._file.flush()
 
@@ -182,7 +196,7 @@ class BPlusTree:
         if not self._pending:
             return
         for page_id in sorted(self._pending):
-            self._file.seek(page_id * PAGE_SIZE)
+            self._file.seek(page_id * self.page_size)
             self._file.write(self._serialize_node(self._pending[page_id]))
         self._file.flush()
         self._pending.clear()
@@ -230,7 +244,7 @@ class BPlusTree:
         return node
 
     def _serialize_node(self, node) -> bytes:
-        buf = bytearray(PAGE_SIZE)
+        buf = bytearray(self.page_size)
         if isinstance(node, _Leaf):
             struct.pack_into(LEAF_HEADER_FMT, buf, 0, 1, len(node.keys), node.next)
             pos = LEAF_HEADER_SIZE
@@ -393,6 +407,15 @@ class BPlusTree:
             page_id = node.children[0]
             node = self._load_node(page_id)
         return page_id
+
+    def height(self) -> int:
+        """Número de niveles del árbol (1 = la raíz es una hoja)."""
+        levels = 1
+        node = self._load_node(self.root_page)
+        while isinstance(node, _Internal):
+            levels += 1
+            node = self._load_node(node.children[0])
+        return levels
 
     def range_search(self, lo=None, hi=None, lo_inc: bool = True,
                      hi_inc: bool = True) -> list[RID]:

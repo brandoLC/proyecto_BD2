@@ -1,0 +1,554 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue, citecolor=black}
+
+\title{Base de Datos II (CS2042)\\
+Proyecto del Curso: Gestor de Bases de Datos Multimodal\\
+Entregable 1}
+% Editar aquí si hay más miembros en el equipo:
+\author{Brando Lopez}
+\date{Universidad de Ingeniería y Tecnología (UTEC)\\
+Docente: Percy Lovon Ramos\\
+Ciclo 2026-II}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Introducción y objetivos}
+
+MiniDB es un motor de bases de datos construido \emph{desde cero} en Python,
+sin librerías de bases de datos ni ORMs, como exige el proyecto del curso.
+Toda la persistencia se implementa directamente sobre archivos binarios
+organizados en \textbf{páginas de 4 KB} leídas y escritas con
+\texttt{seek}/\texttt{read}/\texttt{write} y serialización \texttt{struct}.
+
+El objetivo central es comprender y demostrar experimentalmente cómo la
+\emph{organización física} de los datos determina el costo de las operaciones,
+medido en términos de lo que realmente importa en un DBMS: el número de
+\textbf{bloques de disco} leídos y escritos (I/O), no solo el tiempo de CPU.
+
+Los objetivos específicos del Entregable 1 son:
+
+\begin{itemize}
+  \item Implementar un heap file sobre páginas ranuradas con lista de libres.
+  \item Implementar un \emph{Sequential File} (área principal ordenada + área
+        de overflow encadenada + reorganización con fill factor).
+  \item Implementar índices B+ Tree y Hash Extensible sobre archivo,
+        y un R-Tree como extensión espacial.
+  \item Integrar un motor SQL mínimo (parser, catálogo, ejecutor con plan)
+        que elija la vía de acceso adecuada.
+  \item Instrumentar un contador de I/O físico y validar experimentalmente
+        las complejidades teóricas: $O(P)$ del escaneo secuencial,
+        $O(\log N)$ del B+ Tree, $O(1)$ del hash, búsqueda binaria del
+        archivo secuencial.
+\end{itemize}
+
+\section{Diseño físico de almacenamiento}
+
+\subsection{Página ranurada (slotted page) de 4 KB}
+
+La unidad básica de almacenamiento es la página de 4096 bytes con el
+siguiente layout:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Región} & \textbf{Contenido} \\
+\midrule
+Cabecera (4 B) & \texttt{slot\_count} (H), \texttt{free\_start} (H) \\
+Slot array & 6 B por slot: (\texttt{offset} H, \texttt{length} H, \texttt{alive} B, res B) \\
+\ldots & espacio libre contiguo \\
+Tuplas & escritas desde el final de la página hacia atrás \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Los registros crecen desde el final de la página hacia el inicio y el slot
+array crece desde el inicio; \texttt{free\_start} marca el límite del área
+de datos. La eliminación es \textbf{lógica}: marca el slot como muerto
+(\texttt{alive = 0}) sin mover bytes, de modo que el \texttt{slot\_id}
+permanece estable. Si una inserción no encuentra espacio contiguo, la página
+se compacta (reubicando solo los registros vivos) antes de declararla llena.
+
+\subsection{RID}
+
+Todo registro se identifica por \texttt{RID = (page\_id, slot\_id)}. El RID
+es estable ante compactaciones y es la referencia que devuelven todos los
+índices. En el Sequential File, a los RIDs del área de overflow se les suma
+una base ($2^{20}$) para distinguir el área sin estructuras adicionales.
+
+\subsection{Serialización con \texttt{struct}}
+
+Las filas se serializan campo a campo según el esquema, sin pickle:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Tipo SQL} & \textbf{Formato struct} & \textbf{Tamaño} \\
+\midrule
+INT & \texttt{<i} & 4 B \\
+FLOAT & \texttt{<d} & 8 B \\
+BOOL & \texttt{<?} & 1 B \\
+VARCHAR($n$) & \texttt{<$n$s} & $n$ B (padding NUL) \\
+POINT & \texttt{<dd} & 16 B \\
+TEXT & \texttt{<H} + bytes & variable \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Las claves de índice usan la misma codificación de longitud fija
+(\texttt{encode\_key}/\texttt{decode\_key}), lo que permite comparar
+valores decodificados y calcular capacidades exactas por página.
+
+\subsection{Heap file con free list}
+
+El heap file guarda una página 0 de cabecera (magic, contadores y la
+\emph{free list} de RIDs de slots eliminados, con capacidad
+\texttt{MAX\_FREE} $= (4096 - \text{cabecera}) / 6$ entradas). La inserción
+reutiliza primero slots de la lista de libres; si está vacía intenta la
+última página y, en última instancia, agrega una página nueva. Los slots
+muertos que no caben en la lista se contabilizan (\texttt{dropped\_free})
+y se recuperan con un escaneo de respaldo solo cuando hubo desborde, evitando
+barridos $O(P)$ innecesarios.
+
+\section{Sequential File}
+
+\subsection{Estructura}
+
+Dos archivos por tabla: \texttt{<tabla>.seq} (área principal, registros
+ordenados físicamente por la clave primaria, con búsqueda binaria por
+páginas) y \texttt{<tabla>.ovf} (área de overflow). Formato de registro en
+ambas áreas:
+
+\begin{center}
+\texttt{[key\_bytes (fijo)][next\_page: I][next\_slot: H][payload]}
+\end{center}
+
+El puntero \texttt{next} mantiene el \emph{orden lógico} encadenando los
+registros del overflow entre los de la principal. La cabecera del
+\texttt{.seq} guarda además los punteros \texttt{head} y \texttt{tail} de la
+cadena: \texttt{head} permite arrancar el recorrido tras eliminar el primer
+registro, y \texttt{tail} da un camino rápido $O(1)$ para inserciones al
+final (clave mayor que todas), decisión clave para que la carga masiva
+ordenada sea $O(N)$ en vez de $O(N^2)$.
+
+\subsection{Búsqueda}
+
+La búsqueda puntual hace \textbf{búsqueda binaria por páginas} en la
+principal (comparando la primera clave física de cada página, que sigue
+siendo válida aunque el registro esté eliminado), retrocede hasta el último
+registro \emph{vivo} con clave $\le$ la buscada y desde ahí recorre la
+cadena del overflow, deteniéndose al pasar la clave. Los rangos
+(\texttt{BETWEEN}, $<$, $\le$, $>$, $\ge$) comparten el mismo punto de
+partida y recorren la cadena hasta salir del rango. Costo:
+$O(\log P) + $ longitud de la cadena atravesada.
+
+\subsection{Inserción y eliminación}
+
+Insertar ubica al predecesor con la búsqueda anterior, escribe el registro
+en el overflow (reutilizando una free list simple en la cabecera del
+\texttt{.ovf}) y reenlaza: \texttt{new.next = pred.next; pred.next = new}.
+Eliminar reenlaza al predecesor y marca el slot como muerto; el espacio del
+overflow se reutiliza vía la free list y el de la principal se recupera en
+la reorganización.
+
+\subsection{Reorganización con fill factor}
+
+\texttt{reorganize(fill\_factor)} recorre la cadena completa (vivos de
+ambas áreas en orden), reescribe un \texttt{.seq} nuevo con páginas llenas
+al 70--80\% (empaquetado greedy), reconstituye \texttt{next} como el
+siguiente físico y trunca el \texttt{.ovf} a su cabecera. El reemplazo es
+atómico (archivo temporal + \texttt{os.replace}) y la operación devuelve
+estadísticas: páginas antes/después, registros movidos y muertos purgados.
+
+\section{Índices}
+
+\subsection{B+ Tree}
+
+Persistido en su propio archivo de páginas de 4 KB: página 0 de cabecera
+(magic, raíz, número de páginas, tamaño de clave) y una página por nodo,
+con capacidades calculadas para que cada nodo quepa exactamente en una
+página. Soporta claves duplicadas ordenando por la tupla \texttt{(key, rid)}
+(los separadores internos también son pares). Las hojas se enlazan con un
+puntero \texttt{next}, de modo que un \emph{range search} baja una vez por
+el árbol ($O(\log N)$) y luego recorre hojas contiguas. Incluye caché de
+nodos y modo de carga masiva con volcado diferido.
+
+\subsection{Hash Extensible}
+
+Función hash FNV-1a de 32 bits implementada a mano. Directorio de $2^g$
+entradas u32 indexadas por los $g$ bits menos significativos del hash;
+buckets de capacidad fija con profundidad local; split con duplicación del
+directorio cuando la profundidad local iguala a la global.
+
+\paragraph{Lección de ingeniería (EXH1 $\to$ EXH2).}
+La primera versión del índice cargaba \emph{todo} el archivo a memoria al
+abrirlo y lo reescribía completo en cada mutación. Como el ejecutor abre el
+índice en cada consulta, una búsqueda puntual sobre 100 000 claves costaba
+\textbf{259 lecturas de bloque y 60 ms}: el costo de lectura era $O(B)$
+(páginas del índice) por consulta, no $O(1)$. La versión actual (EXH2)
+reserva el directorio con capacidad fija desde el inicio (región
+\emph{sparse} vía \texttt{truncate}, sin costo físico hasta usarse), ubica
+cada bucket en un offset fijo (\texttt{bucket\_id} = posición física) y lee
+perezosamente: cabecera + 1 página de directorio + 1 página de bucket.
+Resultado medido: \textbf{5 lecturas y 0.47 ms} por búsqueda (sección 7.3).
+El formato viejo no se soporta; los índices hash existentes se recrean.
+
+\subsection{R-Tree (extensión espacial)}
+
+Como adelanto de la Parte 2 del proyecto, el motor incluye un R-Tree sobre
+páginas de 4 KB con split cuadrático de Guttman, búsqueda por radio con
+poda por MBR y KNN con cola de prioridad por \emph{mindist}. Sirve como
+índice secundario de columnas \texttt{POINT} y se integra al planificador
+condicional (condiciones \texttt{IN (punto, radio)} y
+\texttt{KNN (punto, k)}).
+
+\section{Motor SQL y planificador}
+
+\subsection{Subconjunto SQL}
+
+Parser recursivo descendente propio (keywords case-insensitive):
+
+\begin{itemize}
+  \item \texttt{CREATE TABLE} (con PK de una columna y
+        \texttt{USING HEAP|SEQUENTIAL}), \texttt{CREATE TABLE ... FROM FILE},
+        \texttt{LOAD INTO ... FROM FILE}, \texttt{DROP TABLE}.
+  \item \texttt{CREATE INDEX [nombre] ON t (col) USING BTREE|HASH|RTREE}.
+  \item \texttt{INSERT INTO ... VALUES}, \texttt{DELETE FROM ... WHERE col = v}.
+  \item \texttt{SELECT} con \texttt{WHERE} (=, $<$, $\le$, $>$, $\ge$,
+        \texttt{BETWEEN}, condiciones espaciales), \texttt{LIMIT/OFFSET} y
+        agregados \texttt{COUNT/MIN/MAX/SUM/AVG}.
+\end{itemize}
+
+\subsection{Selección de la vía de acceso}
+
+El ejecutor construye un plan con tiempos por paso y elige:
+
+\begin{itemize}
+  \item \textbf{Index Scan} (B+ Tree o Hash) para igualdad sobre columna
+        indexada; \textbf{Index Range Scan} (B+ Tree) para rangos.
+  \item \textbf{Binary Search (Sequential)} para predicados sobre la PK de
+        una tabla \texttt{USING SEQUENTIAL} (el propio archivo ordenado es
+        la vía de acceso; no se genera B+ Tree redundante).
+  \item \textbf{Sequential Scan} cuando no hay índice usable.
+\end{itemize}
+
+\subsection{DiskCounter: medición honesta de I/O}
+
+Toda la I/O física del motor pasa por objetos archivo envueltos en
+\texttt{CountedFile}, que suma 1 lectura por \texttt{read()} no vacío y 1
+escritura por \texttt{write()} con datos (1 llamada = 1 bloque, pues el
+código siempre lee/escribe páginas completas de 4 KB). Cada consulta crea un
+contador fresco y devuelve \texttt{result["io"] = \{reads, writes\}}.
+
+La métrica es honesta por construcción: cuenta \emph{llamadas físicas
+reales} al archivo; las lecturas servidas desde las cachés de páginas en
+memoria no cuentan, exactamente como un buffer pool evita I/O real. Así, los
+números reportados son comparables con el modelo de costos del curso.
+
+\section{Arquitectura del sistema}
+
+\begin{itemize}
+  \item \textbf{Motor} (Python puro): \texttt{storage/} (página, heap,
+        sequential file, serialización, disk counter), \texttt{indexes/}
+        (B+ Tree, Hash Extensible, R-Tree), \texttt{engine/} (parser,
+        catálogo JSON, ejecutor, cargador CSV).
+  \item \textbf{API REST} (FastAPI): \texttt{/api/query},
+        \texttt{/api/tables}, \texttt{/api/tables/\{t\}/reorganize}, carga e
+        inferencia de CSV.
+  \item \textbf{Frontend} (React + Vite + Leaflet): consola SQL con plan e
+        I/O por consulta, explorador de tablas y mapa espacial.
+  \item \textbf{Despliegue}: \texttt{docker compose} (backend + frontend con
+        nginx), volumen persistente para los datos.
+\end{itemize}
+
+\section{Experimentación}
+
+\subsection{Metodología}
+
+Scripts en \texttt{benchmarks/} que usan el motor directamente (sin HTTP)
+sobre datos sintéticos \texttt{(id INT PK, nombre VARCHAR(30), valor FLOAT)}
+con semillas aleatorias fijas para reproducibilidad. Se mide por consulta la
+I/O física (\texttt{io.reads}/\texttt{io.writes} del DiskCounter) y la
+latencia en ms; se reporta promedio $\pm$ desviación estándar. La carga es
+en lote (\texttt{bulk\_load\_rows}, el mismo camino físico de la carga CSV),
+no tupla a tupla. Las variantes con índice barajan las claves; el Sequential
+File se carga ordenado (camino rápido del \texttt{tail}) y se reorganiza
+antes de los experimentos de búsqueda, que es la operación periódica normal
+de esta organización. Resultados crudos en \texttt{benchmarks/results/}.
+
+\subsection{Experimento 1: inserción masiva}
+
+Inserción de $N$ registros por organización; tiempo total, escrituras de
+bloques de 4 KB y filas/segundo.
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Organización} & $N{=}10^3$ & $N{=}10^4$ & $N{=}5\cdot10^4$ & $N{=}10^5$ \\
+\midrule
+Heap sin índice      & 0.008 & 0.079 & 0.412 & 0.819 \\
+Heap + B+ Tree (PK)  & 0.037 & 0.442 & 2.929 & 7.075 \\
+Heap + Hash Ext.\ (PK) & 0.030 & 0.356 & 2.220 & 5.245 \\
+Sequential File      & 0.013 & 0.126 & 0.646 & 1.275 \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+(Tiempos en segundos.)
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{loglogaxis}[
+    width=0.85\textwidth, height=6.5cm,
+    xlabel={$N$ (registros)}, ylabel={Tiempo total (s)},
+    legend pos=north west, grid=major, mark size=1.8pt]
+\addplot coordinates {(1000,0.008) (10000,0.079) (50000,0.412) (100000,0.819)};
+\addplot coordinates {(1000,0.037) (10000,0.442) (50000,2.929) (100000,7.075)};
+\addplot coordinates {(1000,0.030) (10000,0.356) (50000,2.220) (100000,5.245)};
+\addplot coordinates {(1000,0.013) (10000,0.126) (50000,0.646) (100000,1.275)};
+\legend{Heap sin índice, Heap + B+ Tree, Heap + Hash Ext., Sequential File}
+\end{loglogaxis}
+\end{tikzpicture}
+\end{center}
+
+Para $N = 100\,000$, las escrituras de bloques fueron: heap 1178, B+ Tree
+1529, Hash 1436 y Sequential 1432 (122 132, 14 135, 19 068 y 78 458
+filas/s respectivamente).
+
+\paragraph{Análisis.}
+El heap pelado es el límite inferior teórico: escribe cada página de datos
+una sola vez (1178 escrituras $\approx$ $N \cdot 48$ B $/ 4096$ B) y su
+throughput es constante ($\sim$120k filas/s en todo el rango), es decir
+$O(1)$ amortizado por tupla. Los índices pagan el mantenimiento de la
+estructura: el B+ Tree escribe $\sim$30\% más bloques y es $8.6\times$ más
+lento en tiempo a $N{=}10^5$ (splits y propagación, $O(\log N)$ por tupla);
+el hash queda intermedio. El Sequential File con carga ordenada es el
+segundo más rápido (1.28 s): gracias al puntero \texttt{tail} persistido,
+cada inserción es $O(1)$ y solo escribe páginas del área de overflow; sin
+ese camino rápido la inserción ordenada recorrería la cadena y degradaría a
+$O(N^2)$.
+
+\subsection{Experimento 2: búsquedas puntuales}
+
+Búsquedas de igualdad \texttt{WHERE id = k} sobre $N = 100\,000$ registros,
+con claves aleatorias existentes (1000 consultas; 100 para el full scan por
+su costo de $\sim$0.3 s por consulta).
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Organización} & \textbf{Reads prom.} & \textbf{Latencia prom.\ (ms)} \\
+\midrule
+Heap sin índice (full scan) & $1178 \pm 0$    & $328.2 \pm 24.6$ \\
+Heap + B+ Tree (PK)         & $6.01 \pm 0.09$ & $0.58 \pm 0.11$ \\
+Heap + Hash Ext.\ (PK)      & $5 \pm 0$       & $0.47 \pm 0.09$ \\
+Sequential File (binaria)   & $16.94 \pm 0.26$ & $0.55 \pm 0.11$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Análisis.}
+Los números replican la teoría casi exactamente. El full scan lee las 1178
+páginas de datos en \emph{todas} las consultas ($O(P)$, std = 0: no depende
+de la clave). El B+ Tree lee $O(\log N)$: cabecera + camino raíz$\to$hoja
+(2 niveles bastan para 100k claves de 4 B) + cabecera del heap + 1 página de
+datos = 6 bloques. El hash gana la igualdad con $O(1)$: cabecera + 1 página
+de directorio + 1 página de bucket + 2 del heap = 5 bloques y la menor
+latencia (0.47 ms) — el acceso es directo por función hash, sin
+comparaciones en niveles intermedios. La búsqueda binaria del Sequential
+File cuesta $\sim$17 lecturas ($\log_2 P$ páginas de la principal más la
+caminata corta y el fetch), ligeramente por encima del B+ Tree porque la
+binaria compara una clave por página sin fan-out interno; sigue siendo dos
+órdenes de magnitud mejor que el scan. Vale contrastar con la versión
+inicial del hash (EXH1): 259 lecturas y 60 ms por la misma búsqueda — el
+formato de archivo importa tanto como la estructura lógica.
+
+\subsection{Experimento 3: búsquedas por rango con selectividad variable}
+
+Rangos \texttt{WHERE id BETWEEN a AND b} del 0.1\%, 1\%, 5\%, 10\% y 25\%
+del total, sobre $N = 100\,000$ (50 consultas por celda; 10 en el full
+scan). Las consultas llevan \texttt{LIMIT} explícito para medir el barrido
+completo del rango sin el tope de seguridad de la consola.
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Organización} & \textbf{Sel.\ \%} & \textbf{Tuplas} & \textbf{Reads prom.} & \textbf{ms prom.} \\
+\midrule
+Heap sin índice & 0.1--25 & 100--25 000 & $1178 \pm 0$ & 300--372 \\
+\midrule
+Heap + B+ Tree & 0.1 & 100    & $101 \pm 1.8$   & $5.6 \pm 4.5$ \\
+Heap + B+ Tree & 1   & 1 000  & $686 \pm 8.9$   & $45.2 \pm 13.9$ \\
+Heap + B+ Tree & 5   & 5 000  & $1183 \pm 5.0$  & $97.0 \pm 18.6$ \\
+Heap + B+ Tree & 10  & 10 000 & $1215 \pm 4.0$  & $122.9 \pm 19.8$ \\
+Heap + B+ Tree & 25  & 25 000 & $1264 \pm 6.0$  & $207.3 \pm 18.0$ \\
+\midrule
+Sequential File & 0.1 & 100    & $18 \pm 0.6$   & $0.96 \pm 0.08$ \\
+Sequential File & 1   & 1 000  & $51 \pm 1.2$   & $5.3 \pm 0.3$ \\
+Sequential File & 5   & 5 000  & $204 \pm 1.5$  & $33.1 \pm 11.7$ \\
+Sequential File & 10  & 10 000 & $396 \pm 1.5$  & $73.1 \pm 16.7$ \\
+Sequential File & 25  & 25 000 & $972 \pm 1.5$  & $202.8 \pm 21.1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tikzpicture}
+\begin{semilogxaxis}[
+    width=0.85\textwidth, height=6.5cm,
+    xlabel={Selectividad del rango (\% del total)},
+    ylabel={Lecturas de bloques (prom.)},
+    legend pos=north west, grid=major, mark size=1.8pt]
+\addplot coordinates {(0.1,1178) (1,1178) (5,1178) (10,1178) (25,1178)};
+\addplot coordinates {(0.1,101.3) (1,685.76) (5,1183.34) (10,1214.62) (25,1264)};
+\addplot coordinates {(0.1,18.24) (1,51.42) (5,204.22) (10,396.02) (25,972.22)};
+\legend{Heap sin índice (scan), Heap + B+ Tree, Sequential File}
+\end{semilogxaxis}
+\end{tikzpicture}
+\end{center}
+
+\paragraph{Análisis: el punto de cruce.}
+El full scan es insensible a la selectividad (siempre 1178 páginas: hay que
+barrer todo el archivo). El B+ Tree degrada con el tamaño del rango porque
+los RIDs que devuelve están \emph{dispersos} por todo el heap (la carga fue
+desordenada): cada tupla del rango puede tocar una página de datos distinta.
+El \textbf{punto de cruce en I/O está entre 1\% y 5\%}: a 1\% el índice lee
+686 páginas y gana claramente; a 5\% lee 1183, ya \emph{más} que barrer el
+archivo completo. En latencia el scan nunca gana en este experimento (207 ms
+del B+ Tree vs 372 ms del scan a 25\%) porque el scan además deserializa las
+100 000 tuplas: el CPU de deserialización domina sobre la I/O extra — un
+matiz útil: el cruce en bloques no implica cruce en tiempo cuando el plan
+alternativo paga CPU por tupla. El Sequential File domina los rangos en toda
+selectividad medida: al ser una organización \emph{clustered} el rango es
+físicamente contiguo, así que sus lecturas escalan con la fracción del
+archivo ($972 \approx 82\%$ de las páginas a 25\%, por el fill factor del
+75\%) sin saltos; a 0.1\% es $5.5\times$ más económico que el B+ Tree (18 vs
+101 lecturas). Es la confirmación experimental de por qué los rangos sobre
+la clave de clustering son el caso ideal de las organizaciones ordenadas.
+
+\subsection{Experimento 4: sensibilidad al tamaño de bloque}
+
+B+ Tree aislado (sin heap) con $N = 100\,000$ claves \texttt{INT} de 4
+bytes insertadas en orden aleatorio, variando el tamaño de página
+$B \in \{1024, 2048, 4096, 8192\}$ bytes (parámetro \texttt{page\_size}
+del \texttt{BPlusTree}; el resto del motor sigue en 4 KB). Para cada $B$
+se mide la capacidad máxima de cada tipo de nodo según su formato de
+serialización, la altura resultante, las lecturas de bloques de 1000
+búsquedas puntuales con la caché de nodos vaciada antes de cada consulta
+(peor caso: cada nivel del camino raíz$\to$hoja es una lectura física) y
+el tamaño total del archivo del índice.
+
+\begin{center}
+\small
+\begin{tabular}{rrrrrrr}
+\toprule
+\textbf{$B$ (B)} & \textbf{Cap.\ hoja} & \textbf{Cap.\ interno} &
+\textbf{Altura} & \textbf{Páginas} & \textbf{MiB} & \textbf{Reads prom.} \\
+\midrule
+1024 & 101 & 72  & 3 & 1449 & 1.42 & $3.03 \pm 0.16$ \\
+2048 & 204 & 145 & 3 & 718  & 1.40 & $3.01 \pm 0.10$ \\
+4096 & 408 & 292 & 3 & 351  & 1.37 & $3.01 \pm 0.08$ \\
+8192 & 818 & 584 & 2 & 160  & 1.25 & $2.00 \pm 0.00$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{minipage}{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+    width=\textwidth, height=6cm,
+    log basis x={2}, log basis y={2},
+    xlabel={$B$ (bytes)}, ylabel={Capacidad (entradas/nodo)},
+    xtick={1024,2048,4096,8192}, xticklabels={1K,2K,4K,8K},
+    legend pos=north west, grid=major, mark size=1.8pt]
+\addplot coordinates {(1024,72) (2048,145) (4096,292) (8192,584)};
+\addplot coordinates {(1024,101) (2048,204) (4096,408) (8192,818)};
+\legend{Nodo interno, Nodo hoja}
+\end{loglogaxis}
+\end{tikzpicture}
+\end{minipage}\hfill
+\begin{minipage}{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{semilogxaxis}[
+    width=\textwidth, height=6cm,
+    log basis x={2},
+    xlabel={$B$ (bytes)}, ylabel={Altura $h$},
+    xtick={1024,2048,4096,8192}, xticklabels={1K,2K,4K,8K},
+    ytick={2,3}, ymin=1.5, ymax=3.5,
+    grid=major, mark size=1.8pt]
+\addplot coordinates {(1024,3) (2048,3) (4096,3) (8192,2)};
+\end{semilogxaxis}
+\end{tikzpicture}
+\end{minipage}
+\end{center}
+
+\paragraph{Análisis.}
+Duplicar $B$ duplica casi exactamente el fan-out: la capacidad del nodo
+interno crece $72 \to 145 \to 292 \to 584$ (separadores de 10 B más un
+hijo por página) y la de la hoja $101 \to 204 \to 408 \to 818$ (entradas
+de 10 B) — el overhead fijo de cabecera (7 B) se vuelve despreciable
+desde 2 KB. Con inserción aleatoria las hojas quedan al $\sim$70\% de
+ocupación, así que $h = \lceil \log_{f}(N/(\text{hoja} \cdot 0.7))
+\rceil$ baja de 3 a 2 recién en $B = 8$ KB: con $f \approx 584$ un solo
+nivel interno basta para direccionar las $\sim$175 hojas. Las lecturas de
+búsqueda replican la altura página a página ($3.0$ vs $h = 3$; el $0.03$
+extra corresponde a las consultas cuya clave es la máxima de su hoja y
+leen la hoja siguiente para confirmar que no hay duplicados), confirmando
+que el costo de la igualdad es exactamente $\Theta(h)$ y que achatar el
+árbol con páginas grandes se traduce en I/O real ahorrada. El tamaño del
+índice es prácticamente constante ($1.25$--$1.42$ MiB): las páginas
+grandes amortiguan cabeceras (160 páginas vs 1449 para la misma
+información). El costo aparece del otro lado: la carga tarda $8.3$ s con
+8 KB frente a $3.2$ s con 1 KB (serializar y escribir nodos de 8 KB por
+split es más caro) y, en un sistema real, leer un bloque de 8 KB para
+usar una entrada de 14 B desperdicia ancho de banda si la carga es de
+búsquedas puntuales. La elección de $B$ es entonces un compromiso entre
+altura del índice y granularidad de transferencia; 4 KB coincide con la
+página del sistema operativo y equilibra ambos extremos.
+
+\section{Conclusiones}
+
+\begin{itemize}
+  \item Las complejidades teóricas se verificaron experimentalmente con I/O
+        física real: $O(P)$ del scan (1178 lecturas constantes), $O(\log N)$
+        del B+ Tree (6 lecturas), $O(1)$ del hash extensible (5 lecturas) y
+        búsqueda binaria del archivo secuencial ($\sim$17 lecturas).
+  \item El formato de persistencia importa tanto como la estructura de
+        datos: reescribir el índice hash completo por operación lo hacía
+        $127\times$ más lento en lectura que su versión paginada perezosa.
+  \item No hay estructura universalmente mejor: el heap gana en inserción,
+        el hash en igualdad, el B+ Tree equilibra igualdad y rangos
+        moderados, y el archivo secuencial domina los rangos gracias a la
+        contigüedad física — el planificador existe precisamente para elegir.
+  \item La selectividad determina cuándo un índice deja de convenir: el
+        punto de cruce medido entre el Index Range Scan y el full scan está
+        entre 1\% y 5\% para esta relación, coherente con lo que estiman los
+        optimizadores de costos de los DBMS reales.
+  \item El tamaño de bloque controla el fan-out y por tanto la altura del
+        B+ Tree: duplicar la página duplica las entradas por nodo, y con 8 KB
+        el árbol de 100\,000 claves baja de 3 a 2 niveles, reduciendo la
+        búsqueda puntual de 3 a 2 lecturas físicas; el índice ocupa el mismo
+        espacio, pero la construcción se encarece.
+\end{itemize}
+
+\end{document}

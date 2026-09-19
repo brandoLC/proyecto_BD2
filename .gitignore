@@ -15,6 +15,14 @@ benchmarks/results/
 # PDFs del curso (material del profesor, no va al repo)
 *.pdf
 
+# Auxiliares de LaTeX (informe/)
+informe/*.aux
+informe/*.out
+informe/*.toc
+informe/*.fdb_latexmk
+informe/*.fls
+informe/*.synctex.gz
+
 # Docker / SO
 *.log
 .DS_Store
