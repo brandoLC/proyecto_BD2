@@ -902,14 +902,16 @@ class Engine:
             selected = ast["columns"]
         where = ast["where"]
         if where is not None:
-            self._get_column(table, where["column"])
+            self._check_where_columns(table, where)
         plan.add("Semantic Check", f"tabla '{table}' y columnas válidas", t)
 
         # Acceso a datos: índice si existe, si no escaneo secuencial
         rids: list[RID] | None = None  # None => escaneo secuencial
         ordered_knn: list[tuple[RID, float]] | None = None
+        residual: dict | None = None  # condiciones del AND fuera del acceso
         if where is not None:
-            rids, ordered_knn = self._plan_access(table, where, plan)
+            rids, ordered_knn, residual = self._plan_access(table, where, plan)
+        knn_cond = self._knn_condition(where)
 
         t = time.perf_counter()
         heap = self._open_storage(table)
@@ -928,8 +930,7 @@ class Engine:
         if rids is None:  # escaneo secuencial
             # El LIMIT se empuja al escaneo: se detiene apenas junta las
             # filas pedidas (salvo KNN por fuerza bruta, que necesita todas).
-            early_stop = not (
-                where is not None and where["kind"] == "knn")
+            early_stop = knn_cond is None
             rows = []
             for rid, raw in self._scan_rows(heap):
                 row = deserialize_row(columns, raw)
@@ -939,13 +940,13 @@ class Engine:
                 if early_stop and len(rows) >= stop_at:
                     break
             fetched = len(rows)  # registros leídos antes de la ventana
-            if where is not None and where["kind"] == "knn":
+            if knn_cond is not None:
                 # KNN por fuerza bruta cuando no hay R-Tree
-                pos = [c.name for c in columns].index(where["column"])
-                cx, cy = where["center"]
+                pos = [c.name for c in columns].index(knn_cond["column"])
+                cx, cy = knn_cond["center"]
                 rows.sort(key=lambda t: math.hypot(t[1][pos][0] - cx,
                                                    t[1][pos][1] - cy))
-                rows = rows[: where["k"]]
+                rows = rows[: knn_cond["k"]]
             # OFFSET/LIMIT (o el tope de seguridad) sobre el resultado.
             if limit is not None:
                 rows = rows[offset:offset + limit]
@@ -953,12 +954,33 @@ class Engine:
                 truncated = len(rows) > SELECT_ROW_CAP
                 rows = rows[:SELECT_ROW_CAP]
         elif ordered_knn is not None:
-            by_rid = dict()
-            for rid, d in ordered_knn:
-                by_rid[rid] = deserialize_row(columns, self._read_row(heap, rid))
-            rows = [(rid, by_rid[rid]) for rid, _ in ordered_knn]
+            rows = []
+            for rid, _d in ordered_knn:
+                row = deserialize_row(columns, self._read_row(heap, rid))
+                if residual is not None and not self._match(
+                        columns, residual, row):
+                    continue
+                rows.append((rid, row))
             fetched = len(rows)
             # offset/limit se aplica sobre out_rows tras la proyección.
+        elif residual is not None:
+            # El acceso por índice solo garantiza la condición driver: el
+            # resto del AND filtra aquí, con parada temprana en stop_at.
+            rows = []
+            fetched = 0
+            for rid in rids:
+                row = deserialize_row(columns, self._read_row(heap, rid))
+                fetched += 1
+                if not self._match(columns, residual, row):
+                    continue
+                rows.append((rid, row))
+                if len(rows) >= stop_at:
+                    break
+            if limit is not None:
+                rows = rows[offset:offset + limit]
+            else:
+                truncated = len(rows) > SELECT_ROW_CAP
+                rows = rows[:SELECT_ROW_CAP]
         else:
             if limit is not None:
                 # pushdown: los RIDs ya cumplen el WHERE
@@ -1047,7 +1069,7 @@ class Engine:
                          "pos": [c.name for c in columns].index(col.name)})
         where = ast["where"]
         if where is not None:
-            self._get_column(table, where["column"])
+            self._check_where_columns(table, where)
         detail = ", ".join(
             f"{a['fn']}(*)" if a["fn"] == "count"
             else f"{a['fn']}({a['column']})" for a in aggs)
@@ -1057,8 +1079,9 @@ class Engine:
         # Mismo método de acceso que un SELECT normal: índice si existe.
         rids: list[RID] | None = None
         ordered_knn: list[tuple[RID, float]] | None = None
+        residual: dict | None = None
         if where is not None:
-            rids, ordered_knn = self._plan_access(table, where, plan)
+            rids, ordered_knn, residual = self._plan_access(table, where, plan)
 
         t = time.perf_counter()
         heap = self._open_storage(table)
@@ -1071,13 +1094,17 @@ class Engine:
         fetched = 0
         if rids is not None:  # acceso por índice (incl. KNN por R-Tree)
             fetched = len(rids)
-            if needs_values:
+            if residual is None and not needs_values:
+                count = len(rids)
+            else:
                 for rid in rids:
                     row = deserialize_row(columns, self._read_row(heap, rid))
+                    if residual is not None and not self._match(
+                            columns, residual, row):
+                        continue
                     count += 1
-                    self._accumulate(aggs, acc, row)
-            else:
-                count = len(rids)
+                    if needs_values:
+                        self._accumulate(aggs, acc, row)
         else:  # escaneo secuencial
             for rid, raw in self._scan_rows(heap):
                 fetched += 1
@@ -1138,12 +1165,102 @@ class Engine:
             return st["total"]
         return st["total"] / st["n"]  # avg: siempre float
 
+    def _split_and(self, table: str, where: dict) -> tuple[dict, dict | None]:
+        """De una conjunción AND elige la condición con mejor método de
+        acceso como driver y devuelve (driver, filtro residual o None)."""
+        conds = where["conditions"]
+        driver = max(conds, key=lambda c: self._access_score(table, c))
+        rest = [c for c in conds if c is not driver]
+        if not rest:
+            residual = None
+        elif len(rest) == 1:
+            residual = rest[0]
+        else:
+            residual = {"kind": "and", "conditions": rest}
+        return driver, residual
+
+    def _access_score(self, table: str, cond: dict) -> int:
+        """Prioridad de una condición como método de acceso:
+        4 = KNN (siempre gobierna: es top-k ordenado, no un predicado),
+        3 = igualdad con índice (o búsqueda binaria en PK sequential),
+        2 = rango/espacial con índice (o rango en PK sequential),
+        1 = radio espacial sin índice (fuerza bruta sobre el scan),
+        0 = sin acceso directo (solo sirve de filtro)."""
+        col = self._get_column(table, cond["column"])
+        kind = cond["kind"]
+        pk = self.catalog.primary_key(table)
+        if (pk is not None and col.name == pk.name
+                and kind in ("compare", "between")
+                and self._is_sequential(table)):
+            if kind == "compare" and cond["op"] == "=":
+                return 3
+            return 2
+        if kind == "compare":
+            if (cond["op"] == "=" and col.type != TYPE_POINT
+                    and self.catalog.index_on(table, col.name,
+                                              {"BTREE", "HASH"})):
+                return 3
+            if (cond["op"] in ("<", "<=", ">", ">=") and col.type != TYPE_POINT
+                    and self.catalog.index_on(table, col.name, {"BTREE"})):
+                return 2
+            return 0
+        if kind == "between":
+            if (col.type != TYPE_POINT
+                    and self.catalog.index_on(table, col.name, {"BTREE"})):
+                return 2
+            return 0
+        # KNN no es un predicado booleano (es top-k ordenado): si aparece
+        # en una conjunción siempre gobierna el acceso y el resto del AND
+        # queda como filtro residual sobre sus resultados.
+        if kind == "knn":
+            return 4
+        if kind == "radius":
+            if (col.type == TYPE_POINT
+                    and self.catalog.index_on(table, col.name, {"RTREE"})):
+                return 2
+            return 1
+        return 0
+
+    def _check_where_columns(self, table: str, where: dict) -> None:
+        """Valida que todas las columnas del WHERE existan en la tabla."""
+        if where["kind"] == "and":
+            for cond in where["conditions"]:
+                self._get_column(table, cond["column"])
+        else:
+            self._get_column(table, where["column"])
+
+    @staticmethod
+    def _knn_condition(where: dict | None) -> dict | None:
+        """La condición KNN del WHERE (directa o dentro de un AND), si hay."""
+        if where is None:
+            return None
+        if where["kind"] == "knn":
+            return where
+        if where["kind"] == "and":
+            return next((c for c in where["conditions"]
+                         if c["kind"] == "knn"), None)
+        return None
+
     def _plan_access(self, table: str, where: dict,
                      plan: _Plan) -> tuple[list[RID] | None,
-                                           list[tuple[RID, float]] | None]:
-        """Elige el método de acceso y devuelve RIDs (None = seq scan)."""
-        col = self._get_column(table, where["column"])
+                                           list[tuple[RID, float]] | None,
+                                           dict | None]:
+        """Elige el método de acceso y devuelve (RIDs, KNN ordenado,
+        filtro residual). RIDs None = seq scan; con una conjunción AND la
+        mejor condición gobierna el acceso y el resto queda como filtro
+        residual sobre las tuplas recuperadas."""
         kind = where["kind"]
+        if kind == "and":
+            driver, residual = self._split_and(table, where)
+            rids, ordered_knn, _ = self._plan_access(table, driver, plan)
+            t = time.perf_counter()
+            n = len(where["conditions"]) - 1
+            plan.add("Residual Filter",
+                     f"AND: {n} condición(es) restante(s) filtran las "
+                     f"tuplas recuperadas", t)
+            return rids, ordered_knn, residual
+
+        col = self._get_column(table, where["column"])
 
         pk = self.catalog.primary_key(table)
         if (pk is not None and col.name == pk.name
@@ -1166,7 +1283,7 @@ class Engine:
                     plan.add("Index Scan",
                              f"USING {meta['type']} ON {table}.{col.name} "
                              f"= {value!r} -> {len(rids)} RIDs", t)
-                    return rids, None
+                    return rids, None, None
             elif op in ("<", "<=", ">", ">=") and col.type != TYPE_POINT:
                 meta = self.catalog.index_on(table, col.name, {"BTREE"})
                 if meta is not None:
@@ -1184,11 +1301,11 @@ class Engine:
                     plan.add("Index Range Scan",
                              f"USING BTREE ON {table}.{col.name} {op} {value!r} "
                              f"-> {len(rids)} RIDs", t)
-                    return rids, None
+                    return rids, None, None
             t = time.perf_counter()
             plan.add("Sequential Scan",
                      f"sin índice usable para {table}.{col.name} {op}", t)
-            return None, None
+            return None, None, None
 
         if kind == "between":
             low = coerce_value(where["low"], col)
@@ -1203,11 +1320,11 @@ class Engine:
                 plan.add("Index Range Scan",
                          f"USING BTREE ON {table}.{col.name} "
                          f"BETWEEN {low!r} AND {high!r} -> {len(rids)} RIDs", t)
-                return rids, None
+                return rids, None, None
             t = time.perf_counter()
             plan.add("Sequential Scan",
                      f"sin índice BTREE para {table}.{col.name}", t)
-            return None, None
+            return None, None, None
 
         if kind in ("radius", "knn"):
             if col.type != TYPE_POINT:
@@ -1225,24 +1342,24 @@ class Engine:
                              f"USING RTREE ON {table}.{col.name} "
                              f"centro={where['center']} r={where['radius']} "
                              f"-> {len(rids)} RIDs", t)
-                    return rids, None
+                    return rids, None, None
                 results = idx.knn(where["center"], where["k"])
                 idx.close()
                 plan.add("R-Tree KNN Search",
                          f"USING RTREE ON {table}.{col.name} "
                          f"centro={where['center']} k={where['k']}", t)
-                return [rid for rid, _ in results], results
+                return [rid for rid, _ in results], results, None
             # Respaldo sin índice: fuerza bruta
             t = time.perf_counter()
             plan.add("Sequential Scan",
                      f"sin RTREE en {table}.{col.name}: "
                      f"cómputo espacial por fuerza bruta", t)
-            return None, None
+            return None, None, None
 
         raise ExecutionError(f"condición no soportada: {kind}")
 
     def _plan_access_sequential(self, table: str, pk: Column, where: dict,
-                                plan: _Plan) -> tuple[list[RID], None]:
+                                plan: _Plan) -> tuple[list[RID], None, None]:
         """Acceso por la PK de una tabla SEQUENTIAL: búsqueda binaria en el
         área principal + recorrido de la cadena del overflow."""
         storage = self._open_storage(table)
@@ -1277,16 +1394,19 @@ class Engine:
                       f"-> {len(rids)} RIDs")
         storage.close()
         plan.add("Binary Search (Sequential)", detail, t)
-        return rids, None
+        return rids, None, None
 
     # ------------------------------------------------------------------
     # Filtro en escaneo secuencial
     # ------------------------------------------------------------------
     def _match(self, columns: list[Column], where: dict, row: list) -> bool:
+        kind = where["kind"]
+        if kind == "and":
+            return all(self._match(columns, c, row)
+                       for c in where["conditions"])
         col = next(c for c in columns if c.name == where["column"])
         pos = [c.name for c in columns].index(col.name)
         value = row[pos]
-        kind = where["kind"]
         if kind == "compare":
             try:
                 target = coerce_value(where["value"], col)
@@ -1325,7 +1445,7 @@ class Engine:
 
         where = {"kind": "compare", "column": col.name, "op": "=",
                  "value": ast["value"]}
-        rids, _ = self._plan_access(table, where, plan)
+        rids, _, _ = self._plan_access(table, where, plan)
         if rids is None:
             t = time.perf_counter()
             heap = self._open_storage(table)

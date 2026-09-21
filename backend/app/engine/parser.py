@@ -14,7 +14,7 @@ Gramática soportada (keywords case-insensitive, ';' final opcional)::
     insert      := INSERT INTO ident VALUES '(' value (',' value)* ')'
     value       := ['-'] NUMBER | STRING | TRUE | FALSE | '(' num ',' num ')'
     select      := SELECT ('*' | select_item (',' select_item)*) FROM ident
-                   [WHERE cond] [LIMIT num [OFFSET num]]
+                   [WHERE cond (AND cond)*] [LIMIT num [OFFSET num]]
     select_item := '*' | ident | COUNT '(' '*' ')'
                  | MIN '(' ident ')' | MAX '(' ident ')'
                  | SUM '(' ident ')' | AVG '(' ident ')'
@@ -333,6 +333,13 @@ class Parser:
         where = None
         if self.accept_kw("WHERE"):
             where = self._parse_condition()
+            # Conjunción: el AND interno de BETWEEN ya se consumió dentro
+            # de _parse_condition, así que un AND aquí une condiciones.
+            if self.peek().kind == "kw" and self.peek().value == "AND":
+                conditions = [where]
+                while self.accept_kw("AND"):
+                    conditions.append(self._parse_condition())
+                where = {"kind": "and", "conditions": conditions}
         limit = None
         if self.accept_kw("LIMIT"):
             n = self.expect_number()
