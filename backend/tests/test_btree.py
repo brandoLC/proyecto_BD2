@@ -122,7 +122,7 @@ class TestPageSizeYAltura:
             assert small.leaf_cap < cap_hoja_4k
             assert small.internal_cap < cap_int_4k
             # (1024 - header) // (key + rid) para hoja de claves INT
-            assert small.leaf_cap == (1024 - 7) // (4 + 6)
+            assert small.leaf_cap == (1024 - 11) // (4 + 6)
 
     def test_insertar_buscar_y_reabrir_con_otro_page_size(self, tmp_path):
         rng = random.Random(7)
@@ -156,3 +156,59 @@ class TestPageSizeYAltura:
             # altura = niveles del camino raíz->hoja; consistente con
             # que una búsqueda lee exactamente h páginas de nodos.
             assert t.search(4999) == [(4999, 0)]
+
+
+class TestDobleEnlaceHojas:
+    """Los splits mantienen la lista doblemente enlazada (next/prev)."""
+
+    def _hojas(self, t):
+        """Ids de las hojas en orden, siguiendo ``next`` desde la izquierda."""
+        ids = []
+        pid = t._leftmost_leaf()
+        while pid:
+            leaf = t._load_node(pid)
+            ids.append(pid)
+            pid = leaf.next
+        return ids
+
+    def test_prev_y_next_consistentes_tras_splits(self, tmp_path):
+        rng = random.Random(3)
+        keys = rng.sample(range(10_000), 1000)
+        with make_tree(tmp_path) as t:
+            for i, k in enumerate(keys):
+                t.insert(k, (i, 0))
+            ids = self._hojas(t)
+            assert len(ids) > 2  # hubo varios splits
+            assert t._load_node(ids[0]).prev == 0
+            for i, pid in enumerate(ids):
+                leaf = t._load_node(pid)
+                esperado_prev = ids[i - 1] if i > 0 else 0
+                esperado_next = ids[i + 1] if i + 1 < len(ids) else 0
+                assert leaf.prev == esperado_prev
+                assert leaf.next == esperado_next
+
+    def test_recorrido_hacia_atras_con_prev(self, tmp_path):
+        with make_tree(tmp_path) as t:
+            for i in range(500):
+                t.insert(i, (i, 0))
+            ids = self._hojas(t)
+            # desde la última hoja hacia la primera, por prev
+            atras = []
+            pid = ids[-1]
+            while pid:
+                atras.append(pid)
+                pid = t._load_node(pid).prev
+            assert atras == ids[::-1]
+
+    def test_prev_sobrevive_reapertura(self, tmp_path):
+        path = str(tmp_path / "t.btree")
+        with BPlusTree(path, 4, lambda v: struct.pack("<i", v),
+                       lambda b: struct.unpack("<i", b)[0], create=True) as t:
+            for i in range(500):
+                t.insert(i, (i, 0))
+        with BPlusTree(path, 4, lambda v: struct.pack("<i", v),
+                       lambda b: struct.unpack("<i", b)[0]) as t:
+            ids = self._hojas(t)
+            assert len(ids) > 1
+            for i, pid in enumerate(ids):
+                assert t._load_node(pid).prev == (ids[i - 1] if i > 0 else 0)

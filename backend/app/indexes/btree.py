@@ -16,7 +16,8 @@ separadores de los nodos internos también son pares ``(key, rid)`` (la
 primera entrada del subárbol derecho), lo que mantiene el invariante
 estricto del B+ tree incluso con duplicados.
 
-Las hojas se enlazan con un puntero ``next`` para los range search.
+Las hojas se enlazan con punteros ``next`` y ``prev`` (lista doblemente
+enlazada) para los range search y recorridos en ambos sentidos.
 
 Operaciones: ``insert``, ``search`` (punto), ``range_search`` y
 ``delete``. La eliminación no fusiona nodos (se tolera underflow), una
@@ -39,7 +40,7 @@ HEADER_SIZE = struct.calcsize(HEADER_FMT)
 RID_FMT = "<IH"  # page_id, slot_id
 RID_SIZE = struct.calcsize(RID_FMT)
 
-LEAF_HEADER_FMT = "<BHI"  # is_leaf, count, next_leaf
+LEAF_HEADER_FMT = "<BHII"  # is_leaf, count, next_leaf, prev_leaf (0 = ninguno)
 LEAF_HEADER_SIZE = struct.calcsize(LEAF_HEADER_FMT)
 
 INTERNAL_HEADER_FMT = "<BH"  # is_leaf, count
@@ -50,12 +51,13 @@ INF_RID: RID = (0xFFFFFFFF, 0xFFFF)
 
 
 class _Leaf:
-    __slots__ = ("keys", "rids", "next")
+    __slots__ = ("keys", "rids", "next", "prev")
 
     def __init__(self) -> None:
         self.keys: list = []
         self.rids: list[RID] = []
         self.next: int = 0  # 0 = no hay hoja siguiente
+        self.prev: int = 0  # 0 = no hay hoja anterior
 
 
 class _Internal:
@@ -216,9 +218,10 @@ class BPlusTree:
         data = self._read_raw(page_id)
         is_leaf = data[0]
         if is_leaf:
-            _, count, nxt = struct.unpack_from(LEAF_HEADER_FMT, data, 0)
+            _, count, nxt, prv = struct.unpack_from(LEAF_HEADER_FMT, data, 0)
             node = _Leaf()
             node.next = nxt
+            node.prev = prv
             pos = LEAF_HEADER_SIZE
             for _ in range(count):
                 key = self.decode(data[pos : pos + self.key_size])
@@ -246,7 +249,8 @@ class BPlusTree:
     def _serialize_node(self, node) -> bytes:
         buf = bytearray(self.page_size)
         if isinstance(node, _Leaf):
-            struct.pack_into(LEAF_HEADER_FMT, buf, 0, 1, len(node.keys), node.next)
+            struct.pack_into(LEAF_HEADER_FMT, buf, 0, 1, len(node.keys),
+                             node.next, node.prev)
             pos = LEAF_HEADER_SIZE
             for key, rid in zip(node.keys, node.rids):
                 buf[pos : pos + self.key_size] = self.encode(key)
@@ -338,18 +342,25 @@ class BPlusTree:
             if len(node.keys) <= self.leaf_cap:
                 self._store_node(page_id, node)
                 return None
-            # split de hoja
+            # split de hoja: el nuevo nodo queda entre esta hoja y su
+            # antiguo next; hay que actualizar el prev del antiguo next.
             mid = len(node.keys) // 2
             right = _Leaf()
             right.keys = node.keys[mid:]
             right.rids = node.rids[mid:]
             right.next = node.next
+            right.prev = page_id
             node.keys = node.keys[:mid]
             node.rids = node.rids[:mid]
             new_page = self._alloc_page()
+            old_next = node.next
             node.next = new_page
             self._store_node(page_id, node)
             self._store_node(new_page, right)
+            if old_next:
+                old_next_leaf = self._load_node(old_next)
+                old_next_leaf.prev = new_page
+                self._store_node(old_next, old_next_leaf)
             return (right.keys[0], right.rids[0], new_page)
 
         idx = self._child_index(node, key, rid)

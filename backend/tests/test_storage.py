@@ -69,6 +69,27 @@ class TestSlottedPage:
         assert copia.read(s2) == b"\x00\x01\x02"
         assert copia.free_space() == page.free_space()
 
+    def test_cabecera_completa_roundtrip(self):
+        """page_id, record_count, next_page_id y prev_page_id viajan en
+        la cabecera; record_count refleja solo los registros vivos."""
+        page = SlottedPage(page_id=7)
+        page.next_page_id = 8
+        page.prev_page_id = 6
+        s1 = page.insert(b"vivo")
+        page.insert(b"muerto")
+        page.delete(page.insert(b"otro muerto"))
+        data = page.to_bytes()
+        copia = SlottedPage.from_bytes(data)
+        assert copia.page_id == 7
+        assert copia.next_page_id == 8
+        assert copia.prev_page_id == 6
+        assert copia.alive_count() == 2  # vivo + muerto (sin delete)
+        import struct as st
+        _, _, record_count, free_off, _, _ = st.unpack_from("<IHHHii", data, 0)
+        assert record_count == 2
+        assert free_off == page.free_start
+        assert copia.read(s1) == b"vivo"
+
 
 class TestHeapFile:
     def test_insert_scan(self, tmp_path):
@@ -123,3 +144,27 @@ class TestHeapFile:
             for i in range(100):
                 hf.insert(f"r{i}".encode())
         assert os.path.getsize(path) % PAGE_SIZE == 0
+
+    def test_paginas_encadenadas(self, tmp_path):
+        """Las páginas de datos quedan doblemente enlazadas."""
+        with HeapFile(str(tmp_path / "t.heap"), create=True) as hf:
+            for _ in range(5):
+                hf.insert(b"x" * 3000)  # ~1 registro por página
+            assert hf.page_count == 6  # cabecera + 5 páginas de datos
+            for pid in range(1, hf.page_count):
+                page = hf._read_page(pid)
+                assert page.page_id == pid
+                assert page.prev_page_id == (pid - 1 if pid > 1 else -1)
+                assert page.next_page_id == (
+                    pid + 1 if pid < hf.page_count - 1 else -1)
+                assert page.alive_count() == 1
+
+    def test_cadena_sobrevive_reapertura(self, tmp_path):
+        path = str(tmp_path / "t.heap")
+        with HeapFile(path, create=True) as hf:
+            for _ in range(3):
+                hf.insert(b"x" * 3000)
+        with HeapFile(path) as hf:
+            p2 = hf._read_page(2)
+            assert (p2.prev_page_id, p2.next_page_id) == (1, 3)
+            assert hf._read_page(3).next_page_id == -1

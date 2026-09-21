@@ -5,10 +5,13 @@ Dos archivos por tabla:
 - ``<base>.seq`` — área principal: página 0 = cabecera (magic, page_count,
   row_count, key_size, punteros head/tail de la cadena); páginas 1..N con
   los registros ordenados físicamente por clave (admite búsqueda binaria
-  por páginas).
+  por páginas), encadenadas entre sí con ``next_page_id``/``prev_page_id``
+  de la cabecera de página.
 - ``<base>.ovf`` — área de overflow: página 0 = cabecera con una free list
   simple de slots muertos reutilizables; páginas 1..M con los registros
-  insertados que no caben en la principal.
+  insertados que no caben en la principal. Aquí el encadenamiento es a
+  nivel de registro (``next``), así que los punteros de página
+  ``next_page_id``/``prev_page_id`` quedan en -1.
 
 Formato de registro en ambas áreas::
 
@@ -44,7 +47,8 @@ import struct
 from typing import Iterator
 
 from .disk_counter import CountedFile, DiskCounter
-from .page import PAGE_SIZE, PageFullError, SlottedPage
+from .page import HEADER_SIZE as _PAGE_HEADER
+from .page import PAGE_SIZE, SLOT_SIZE as _SLOT_SIZE, PageFullError, SlottedPage
 
 SEQ_MAGIC = b"SEQ1"
 # magic, page_count, row_count, key_size, head(page, slot), tail(page, slot)
@@ -68,9 +72,6 @@ END: RID = (0, 0)  # fin de cadena / cadena vacía (página 0 = cabecera)
 
 # Base sumada al page_id de los RIDs del área de overflow.
 OVF_BASE = 1 << 20
-
-_PAGE_HEADER = 4  # cabecera de SlottedPage (slot_count, free_start)
-_SLOT_SIZE = 6    # entrada del slot array de SlottedPage
 
 
 def is_overflow_rid(rid: RID) -> bool:
@@ -412,14 +413,14 @@ class SequentialFile:
     def _append_main_record(self, key, payload: bytes) -> RID:
         """Agrega el primer registro del archivo en una página nueva."""
         rec = self._pack_record(key, END, payload)
-        page = SlottedPage()
+        page_id = self.page_count
+        page = SlottedPage(page_id=page_id)  # única página: next/prev en -1
         try:
             sid = page.insert(rec)
         except PageFullError as exc:
             raise ValueError(
                 f"registro de {len(rec)} bytes no cabe en una página de 4 KB"
             ) from exc
-        page_id = self.page_count
         self._write_seq_page(page_id, page)
         self.page_count += 1
         return (page_id, sid)
@@ -453,14 +454,16 @@ class SequentialFile:
             except PageFullError:
                 pass
 
-        page = SlottedPage()
+        page_id = self.ovf_page_count
+        # Overflow: encadenamiento a nivel de registro; los punteros de
+        # página (next_page_id/prev_page_id) quedan en -1.
+        page = SlottedPage(page_id=page_id)
         try:
             sid = page.insert(rec)
         except PageFullError as exc:
             raise ValueError(
                 f"registro de {len(rec)} bytes no cabe en una página de 4 KB"
             ) from exc
-        page_id = self.ovf_page_count
         self._write_ovf_page(page_id, page)
         self.ovf_page_count += 1
         self.ovf_row_count += 1
@@ -664,7 +667,10 @@ class SequentialFile:
             f.seek(0)
             f.write(buf)
             for i, recs in enumerate(packed, start=1):
-                page = SlottedPage()
+                page = SlottedPage(page_id=i)
+                # Área principal: páginas ordenadas encadenadas entre sí.
+                page.prev_page_id = i - 1 if i > 1 else -1
+                page.next_page_id = i + 1 if i < len(packed) else -1
                 for j, (k, payload) in enumerate(recs):
                     if j + 1 < len(recs):
                         nxt = (i, j + 1)

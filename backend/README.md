@@ -22,7 +22,9 @@ SQL → parser (tokenizer + recursivo descendente, AST)
 ```
 
 - `app/storage/page.py` — `SlottedPage` de 4096 bytes: cabecera
-  (número de slots, puntero de espacio libre), slot array de
+  (`page_id`, `slot_count`, `record_count` de registros vivos,
+  `free_space_offset` y punteros `next_page_id`/`prev_page_id` que
+  encadenan las páginas de datos del archivo), slot array de
   (offset, longitud, flag vivo) y tuplas escritas desde el final de la
   página hacia atrás. `delete` marca el slot como muerto (el `slot_id`
   permanece estable) y `compact()` elimina la fragmentación.
@@ -75,7 +77,7 @@ CREATE INDEX [nombre] ON tabla (col) USING BTREE|HASH|RTREE;
 INSERT INTO t VALUES (v1, v2, ...);          -- un literal POINT se escribe (x, y)
 
 SELECT * | c1, c2 | COUNT(*), MIN(c), MAX(c), SUM(c), AVG(c) FROM t
-  [WHERE cond] [LIMIT n [OFFSET m]];
+  [WHERE cond [AND cond ...]] [LIMIT n [OFFSET m]];
 -- los agregados se combinan entre sí (un solo grupo, sin GROUP BY) y no
 --   con columnas sueltas; siempre devuelven 1 fila (COUNT=0, MIN/MAX/SUM/AVG=NULL sin filas)
 -- cond:
@@ -83,6 +85,8 @@ SELECT * | c1, c2 | COUNT(*), MIN(c), MAX(c), SUM(c), AVG(c) FROM t
 --   col BETWEEN a AND b
 --   pointcol IN ((x, y), r)     -- radio espacial (R-Tree + distancia exacta)
 --   pointcol KNN ((x, y), k)    -- k vecinos más cercanos (R-Tree + min-heap)
+-- con AND el planificador usa el índice de la mejor condición y aplica
+--   el resto como filtro residual (paso "Residual Filter" en el plan)
 
 DELETE FROM t WHERE col = lit;
 

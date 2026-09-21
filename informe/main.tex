@@ -69,7 +69,9 @@ siguiente layout:
 \toprule
 \textbf{Región} & \textbf{Contenido} \\
 \midrule
-Cabecera (4 B) & \texttt{slot\_count} (H), \texttt{free\_start} (H) \\
+Cabecera (16 B) & \texttt{page\_id} (I), \texttt{slot\_count} (H),
+  \texttt{record\_count} (H), \texttt{free\_space\_offset} (H),
+  \texttt{next\_page\_id} (i), \texttt{prev\_page\_id} (i) \\
 Slot array & 6 B por slot: (\texttt{offset} H, \texttt{length} H, \texttt{alive} B, res B) \\
 \ldots & espacio libre contiguo \\
 Tuplas & escritas desde el final de la página hacia atrás \\
@@ -78,8 +80,12 @@ Tuplas & escritas desde el final de la página hacia atrás \\
 \end{center}
 
 Los registros crecen desde el final de la página hacia el inicio y el slot
-array crece desde el inicio; \texttt{free\_start} marca el límite del área
-de datos. La eliminación es \textbf{lógica}: marca el slot como muerto
+array crece desde el inicio; \texttt{free\_space\_offset} marca el límite
+del área de datos. Los punteros \texttt{next\_page\_id}/\texttt{prev\_page\_id}
+($-1$ si no hay vecino) encadenan las páginas de datos de un archivo como
+una lista doblemente enlazada (en el overflow del Sequential File quedan
+en $-1$: ahí el encadenamiento es a nivel de registro). La eliminación es
+\textbf{lógica}: marca el slot como muerto
 (\texttt{alive = 0}) sin mover bytes, de modo que el \texttt{slot\_id}
 permanece estable. Si una inserción no encuentra espacio contiguo, la página
 se compacta (reubicando solo los registros vivos) antes de declararla llena.
@@ -183,9 +189,11 @@ Persistido en su propio archivo de páginas de 4 KB: página 0 de cabecera
 (magic, raíz, número de páginas, tamaño de clave) y una página por nodo,
 con capacidades calculadas para que cada nodo quepa exactamente en una
 página. Soporta claves duplicadas ordenando por la tupla \texttt{(key, rid)}
-(los separadores internos también son pares). Las hojas se enlazan con un
-puntero \texttt{next}, de modo que un \emph{range search} baja una vez por
-el árbol ($O(\log N)$) y luego recorre hojas contiguas. Incluye caché de
+(los separadores internos también son pares). Las hojas forman una lista
+doblemente enlazada con punteros \texttt{next\_leaf\_id} y
+\texttt{prev\_leaf\_id}, de modo que un \emph{range search} baja una vez por
+el árbol ($O(\log N)$) y luego recorre hojas contiguas en cualquier
+sentido. Incluye caché de
 nodos y modo de carga masiva con volcado diferido.
 
 \subsection{Hash Extensible}
@@ -230,7 +238,10 @@ Parser recursivo descendente propio (keywords case-insensitive):
   \item \texttt{CREATE INDEX [nombre] ON t (col) USING BTREE|HASH|RTREE}.
   \item \texttt{INSERT INTO ... VALUES}, \texttt{DELETE FROM ... WHERE col = v}.
   \item \texttt{SELECT} con \texttt{WHERE} (=, $<$, $\le$, $>$, $\ge$,
-        \texttt{BETWEEN}, condiciones espaciales), \texttt{LIMIT/OFFSET} y
+        \texttt{BETWEEN}, condiciones espaciales) con conjunciones
+        \texttt{AND} (el planificador elige el mejor índice de la
+        conjunción y aplica el resto como filtro residual),
+        \texttt{LIMIT/OFFSET} y
         agregados \texttt{COUNT/MIN/MAX/SUM/AVG}.
 \end{itemize}
 
@@ -463,7 +474,7 @@ el tamaño total del archivo del índice.
 \textbf{Altura} & \textbf{Páginas} & \textbf{MiB} & \textbf{Reads prom.} \\
 \midrule
 1024 & 101 & 72  & 3 & 1449 & 1.42 & $3.03 \pm 0.16$ \\
-2048 & 204 & 145 & 3 & 718  & 1.40 & $3.01 \pm 0.10$ \\
+2048 & 203 & 145 & 3 & 718  & 1.40 & $3.01 \pm 0.10$ \\
 4096 & 408 & 292 & 3 & 351  & 1.37 & $3.01 \pm 0.08$ \\
 8192 & 818 & 584 & 2 & 160  & 1.25 & $2.00 \pm 0.00$ \\
 \bottomrule
@@ -505,8 +516,8 @@ el tamaño total del archivo del índice.
 \paragraph{Análisis.}
 Duplicar $B$ duplica casi exactamente el fan-out: la capacidad del nodo
 interno crece $72 \to 145 \to 292 \to 584$ (separadores de 10 B más un
-hijo por página) y la de la hoja $101 \to 204 \to 408 \to 818$ (entradas
-de 10 B) — el overhead fijo de cabecera (7 B) se vuelve despreciable
+hijo por página) y la de la hoja $101 \to 203 \to 408 \to 818$ (entradas
+de 10 B) — el overhead fijo de cabecera (11 B) se vuelve despreciable
 desde 2 KB. Con inserción aleatoria las hojas quedan al $\sim$70\% de
 ocupación, así que $h = \lceil \log_{f}(N/(\text{hoja} \cdot 0.7))
 \rceil$ baja de 3 a 2 recién en $B = 8$ KB: con $f \approx 584$ un solo

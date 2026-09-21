@@ -4,7 +4,8 @@ Estructura del archivo:
 
 - Página 0 (cabecera): magic, número de páginas, número de registros
   vivos y la lista de slots libres (RIDs de registros eliminados).
-- Páginas 1..N: páginas ranuradas con los registros.
+- Páginas 1..N: páginas ranuradas con los registros, encadenadas entre
+  sí con ``next_page_id``/``prev_page_id`` de su cabecera.
 
 RID = (page_id, slot_id). La inserción primero reutiliza slots de la
 lista de libres; si está vacía, intenta la última página y, en última
@@ -153,8 +154,14 @@ class HeapFile:
         self._page_cache.clear()
 
     def _append_page(self) -> int:
-        page = SlottedPage()
         page_id = self.page_count
+        page = SlottedPage(page_id=page_id)
+        if page_id > 1:
+            # Encadenar con la página anterior de datos (doble enlace).
+            prev = self._read_page(page_id - 1)
+            prev.next_page_id = page_id
+            self._write_page(page_id - 1, prev)
+            page.prev_page_id = page_id - 1
         self._write_page(page_id, page)
         self.page_count += 1
         return page_id
