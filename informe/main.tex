@@ -3,28 +3,141 @@
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage[spanish]{babel}
-\usepackage{lmodern}
+\usepackage{newtxtext}
+\usepackage{newtxmath}
+\usepackage{microtype}
 \usepackage[a4paper,margin=2.5cm]{geometry}
 \usepackage{amsmath}
 \usepackage{booktabs}
+\usepackage{colortbl}
 \usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{caption}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
+\usepackage[most]{tcolorbox}
 \usepackage{hyperref}
-\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue, citecolor=black}
 
-\title{Base de Datos II (CS2042)\\
-Proyecto del Curso: Gestor de Bases de Datos Multimodal\\
-Entregable 1}
-% Editar aquí si hay más miembros en el equipo:
-\author{Brando Lopez}
-\date{Universidad de Ingeniería y Tecnología (UTEC)\\
-Docente: Percy Lovon Ramos\\
-Ciclo 2026-II}
+% ================= Paleta institucional =================
+\definecolor{utecblue}{RGB}{0,51,102}
+\definecolor{petroleo}{RGB}{0,105,120}
+\definecolor{oxido}{RGB}{178,88,26}
+\definecolor{grafito}{RGB}{85,85,85}
+\definecolor{fondosuave}{RGB}{240,244,248}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=utecblue,
+  urlcolor=petroleo,
+  citecolor=utecblue,
+  pdftitle={MiniDB: Gestor de Bases de Datos Multimodal -- Entregable 1},
+  pdfauthor={Brando Lopez},
+}
+
+% ================= Títulos de sección =================
+\titleformat{\section}
+  {\Large\bfseries\color{utecblue}}
+  {\thesection}{0.75em}{}
+  [{\color{utecblue!50}\titlerule[0.9pt]}]
+\titleformat{\subsection}
+  {\large\bfseries\color{utecblue!90!black}}
+  {\thesubsection}{0.75em}{}
+\titleformat{\paragraph}[runin]
+  {\normalsize\bfseries\color{petroleo}}
+  {\theparagraph}{1em}{}
+
+% ================= Encabezado y pie =================
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\itshape\color{grafito} Base de Datos II (CS2042)}
+\fancyhead[R]{\small\itshape\color{grafito} MiniDB --- Entregable 1}
+\fancyfoot[C]{\small\color{grafito}\thepage}
+\renewcommand{\headrulewidth}{0.5pt}
+\renewcommand{\headrule}{\color{utecblue!55}\hrule width\headwidth height\headrulewidth}
+\setlength{\headheight}{14.5pt}
+
+% ================= Captions y listas =================
+\captionsetup{font=small, labelfont={bf,color=utecblue}, skip=6pt}
+\setlist{itemsep=2pt, topsep=4pt}
+\renewcommand{\arraystretch}{1.12}
+
+% ================= Estilo común de gráficas =================
+\pgfplotscreateplotcyclelist{paletadoc}{
+  utecblue, mark=*\\
+  petroleo, mark=square*\\
+  oxido, mark=triangle*\\
+  grafito, mark=diamond*\\
+}
+\pgfplotsset{
+  estilodoc/.style={
+    cycle list name=paletadoc,
+    grid style={black!12},
+    major tick style={black!50},
+    axis line style={black!50},
+    tick label style={font=\footnotesize},
+    label style={font=\small},
+    legend style={font=\footnotesize, draw=black!30, rounded corners=1pt, fill=white},
+    line width=0.9pt,
+    mark size=1.8pt,
+  },
+}
+
+% ================= Cajas destacadas =================
+\newtcolorbox{cajaformato}{
+  enhanced, colback=fondosuave, colframe=utecblue,
+  boxrule=0.6pt, arc=1.5mm, left=8pt, right=8pt, top=5pt, bottom=5pt,
+  fontupper=\ttfamily\small
+}
+\newtcolorbox{cajaclave}[1]{
+  enhanced, colback=petroleo!5, colframe=petroleo,
+  boxrule=0.6pt, arc=1.5mm, left=8pt, right=8pt, top=10pt, bottom=6pt,
+  title={#1}, fonttitle=\bfseries\small, coltitle=white,
+  colbacktitle=petroleo,
+  attach boxed title to top left={yshift=-2.5mm, xshift=4mm},
+  boxed title style={arc=1mm, boxrule=0pt, left=5pt, right=5pt,
+    top=2pt, bottom=2pt}
+}
+
+\emergencystretch=1.5em
 
 \begin{document}
 
-\maketitle
+% ======================== PORTADA ========================
+\begin{titlepage}
+\begin{center}
+{\color{utecblue}\rule{\textwidth}{2.2pt}}\\[2.5pt]
+{\color{utecblue!50}\rule{\textwidth}{0.6pt}}
+
+\vspace{1.8cm}
+{\large\scshape\color{grafito} Universidad de Ingeniería y Tecnología --- UTEC}
+
+\vspace{2.2cm}
+{\large\textsc{Base de Datos II (CS2042)}}\\[0.35cm]
+{\color{grafito}\large Proyecto del Curso}
+
+\vspace{1.4cm}
+{\color{utecblue}\Huge\bfseries MiniDB}\\[0.45cm]
+{\LARGE Gestor de Bases de Datos Multimodal}\\[1.1cm]
+{\color{petroleo}\Large\bfseries Entregable 1}
+
+\vfill
+% Editar aquí si hay más miembros en el equipo:
+\begin{tabular}{rl}
+\textbf{Autor:}   & Brando Lopez \\[2pt]
+\textbf{Docente:} & Percy Lovon Ramos \\[2pt]
+\textbf{Ciclo:}   & 2026-II \\
+\end{tabular}
+
+\vspace{1.2cm}
+{\color{grafito}\large \today}\\[0.6cm]
+{\color{utecblue!50}\rule{\textwidth}{0.6pt}}\\[2.5pt]
+{\color{utecblue}\rule{\textwidth}{2.2pt}}
+\end{center}
+\end{titlepage}
+
 \tableofcontents
 \newpage
 
@@ -64,10 +177,14 @@ Los objetivos específicos del Entregable 1 son:
 La unidad básica de almacenamiento es la página de 4096 bytes con el
 siguiente layout:
 
-\begin{center}
-\begin{tabular}{ll}
+\begin{table}[!htb]
+\centering
+\caption{Layout de la página ranurada de 4 KB.}
+\label{tab:slotted}
+\small
+\begin{tabular}{@{}l>{\raggedright\arraybackslash}p{10.6cm}@{}}
 \toprule
-\textbf{Región} & \textbf{Contenido} \\
+\rowcolor{utecblue!10}\textbf{Región} & \textbf{Contenido} \\
 \midrule
 Cabecera (16 B) & \texttt{page\_id} (I), \texttt{slot\_count} (H),
   \texttt{record\_count} (H), \texttt{free\_space\_offset} (H),
@@ -77,7 +194,7 @@ Slot array & 6 B por slot: (\texttt{offset} H, \texttt{length} H, \texttt{alive}
 Tuplas & escritas desde el final de la página hacia atrás \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
 Los registros crecen desde el final de la página hacia el inicio y el slot
 array crece desde el inicio; \texttt{free\_space\_offset} marca el límite
@@ -101,10 +218,13 @@ una base ($2^{20}$) para distinguir el área sin estructuras adicionales.
 
 Las filas se serializan campo a campo según el esquema, sin pickle:
 
-\begin{center}
-\begin{tabular}{lll}
+\begin{table}[!htb]
+\centering
+\caption{Serialización campo a campo de los tipos SQL con \texttt{struct}.}
+\label{tab:struct}
+\begin{tabular}{@{}lll@{}}
 \toprule
-\textbf{Tipo SQL} & \textbf{Formato struct} & \textbf{Tamaño} \\
+\rowcolor{utecblue!10}\textbf{Tipo SQL} & \textbf{Formato struct} & \textbf{Tamaño} \\
 \midrule
 INT & \texttt{<i} & 4 B \\
 FLOAT & \texttt{<d} & 8 B \\
@@ -114,7 +234,7 @@ POINT & \texttt{<dd} & 16 B \\
 TEXT & \texttt{<H} + bytes & variable \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
 Las claves de índice usan la misma codificación de longitud fija
 (\texttt{encode\_key}/\texttt{decode\_key}), lo que permite comparar
@@ -140,9 +260,9 @@ ordenados físicamente por la clave primaria, con búsqueda binaria por
 páginas) y \texttt{<tabla>.ovf} (área de overflow). Formato de registro en
 ambas áreas:
 
-\begin{center}
-\texttt{[key\_bytes (fijo)][next\_page: I][next\_slot: H][payload]}
-\end{center}
+\begin{cajaformato}
+[key\_bytes (fijo)][next\_page: I][next\_slot: H][payload]
+\end{cajaformato}
 
 El puntero \texttt{next} mantiene el \emph{orden lógico} encadenando los
 registros del overflow entre los de la principal. La cabecera del
@@ -203,7 +323,7 @@ entradas u32 indexadas por los $g$ bits menos significativos del hash;
 buckets de capacidad fija con profundidad local; split con duplicación del
 directorio cuando la profundidad local iguala a la global.
 
-\paragraph{Lección de ingeniería (EXH1 $\to$ EXH2).}
+\begin{cajaclave}{Lección de ingeniería (EXH1 $\to$ EXH2)}
 La primera versión del índice cargaba \emph{todo} el archivo a memoria al
 abrirlo y lo reescribía completo en cada mutación. Como el ejecutor abre el
 índice en cada consulta, una búsqueda puntual sobre 100 000 claves costaba
@@ -215,6 +335,7 @@ cada bucket en un offset fijo (\texttt{bucket\_id} = posición física) y lee
 perezosamente: cabecera + 1 página de directorio + 1 página de bucket.
 Resultado medido: \textbf{5 lecturas y 0.20 ms} por búsqueda (sección 7.3).
 El formato viejo no se soporta; los índices hash existentes se recrean.
+\end{cajaclave}
 
 \subsection{R-Tree (extensión espacial)}
 
@@ -266,10 +387,12 @@ escritura por \texttt{write()} con datos (1 llamada = 1 bloque, pues el
 código siempre lee/escribe páginas completas de 4 KB). Cada consulta crea un
 contador fresco y devuelve \texttt{result["io"] = \{reads, writes\}}.
 
+\begin{cajaclave}{Métrica honesta por construcción}
 La métrica es honesta por construcción: cuenta \emph{llamadas físicas
 reales} al archivo; las lecturas servidas desde las cachés de páginas en
 memoria no cuentan, exactamente como un buffer pool evita I/O real. Así, los
 números reportados son comparables con el modelo de costos del curso.
+\end{cajaclave}
 
 \section{Arquitectura del sistema}
 
@@ -307,10 +430,13 @@ de esta organización. Resultados crudos en \texttt{benchmarks/results/}.
 Inserción de $N$ registros por organización; tiempo total, escrituras de
 bloques de 4 KB y filas/segundo.
 
-\begin{center}
-\begin{tabular}{lrrrr}
+\begin{table}[!htb]
+\centering
+\caption{Experimento 1: tiempo total de inserción masiva, en segundos.}
+\label{tab:exp1}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
-\textbf{Organización} & $N{=}10^3$ & $N{=}10^4$ & $N{=}5\cdot10^4$ & $N{=}10^5$ \\
+\rowcolor{utecblue!10}\textbf{Organización} & $N{=}10^3$ & $N{=}10^4$ & $N{=}5\cdot10^4$ & $N{=}10^5$ \\
 \midrule
 Heap sin índice      & 0.004 & 0.045 & 0.228 & 0.476 \\
 Heap + B+ Tree (PK)  & 0.019 & 0.234 & 1.404 & 3.590 \\
@@ -318,17 +444,16 @@ Heap + Hash Ext.\ (PK) & 0.016 & 0.195 & 1.094 & 2.545 \\
 Sequential File      & 0.006 & 0.066 & 0.334 & 0.674 \\
 \bottomrule
 \end{tabular}
+\end{table}
 
-\smallskip
-(Tiempos en segundos.)
-\end{center}
-
-\begin{center}
+\begin{figure}[!htb]
+\centering
 \begin{tikzpicture}
 \begin{loglogaxis}[
+    estilodoc,
     width=0.85\textwidth, height=6.5cm,
     xlabel={$N$ (registros)}, ylabel={Tiempo total (s)},
-    legend pos=north west, grid=major, mark size=1.8pt]
+    legend pos=north west, grid=major]
 \addplot coordinates {(1000,0.004) (10000,0.045) (50000,0.228) (100000,0.476)};
 \addplot coordinates {(1000,0.019) (10000,0.234) (50000,1.404) (100000,3.590)};
 \addplot coordinates {(1000,0.016) (10000,0.195) (50000,1.094) (100000,2.545)};
@@ -336,7 +461,9 @@ Sequential File      & 0.006 & 0.066 & 0.334 & 0.674 \\
 \legend{Heap sin índice, Heap + B+ Tree, Heap + Hash Ext., Sequential File}
 \end{loglogaxis}
 \end{tikzpicture}
-\end{center}
+\caption{Experimento 1: escalamiento del tiempo de inserción con $N$ (escala log--log).}
+\label{fig:exp1}
+\end{figure}
 
 Para $N = 100\,000$, las escrituras de bloques fueron: heap 1192, B+ Tree
 1543, Hash 1450 y Sequential 1432 (210 168, 27 857, 39 287 y 148 331
@@ -361,10 +488,13 @@ Búsquedas de igualdad \texttt{WHERE id = k} sobre $N = 100\,000$ registros,
 con claves aleatorias existentes (1000 consultas; 100 para el full scan por
 su costo de $\sim$0.2 s por consulta).
 
-\begin{center}
-\begin{tabular}{lrrr}
+\begin{table}[!htb]
+\centering
+\caption{Experimento 2: búsquedas puntuales sobre $N = 100\,000$ registros.}
+\label{tab:exp2}
+\begin{tabular}{@{}lrr@{}}
 \toprule
-\textbf{Organización} & \textbf{Reads prom.} & \textbf{Latencia prom.\ (ms)} \\
+\rowcolor{utecblue!10}\textbf{Organización} & \textbf{Reads prom.} & \textbf{Latencia prom.\ (ms)} \\
 \midrule
 Heap sin índice (full scan) & $1192 \pm 0$    & $183.5 \pm 9.4$ \\
 Heap + B+ Tree (PK)         & $6.01 \pm 0.09$ & $0.26 \pm 0.03$ \\
@@ -372,7 +502,7 @@ Heap + Hash Ext.\ (PK)      & $5 \pm 0$       & $0.20 \pm 0.02$ \\
 Sequential File (binaria)   & $16.94 \pm 0.26$ & $0.24 \pm 0.02$ \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
 \paragraph{Análisis.}
 Los números replican la teoría casi exactamente. El full scan lee las 1192
@@ -397,11 +527,14 @@ del total, sobre $N = 100\,000$ (50 consultas por celda; 10 en el full
 scan). Las consultas llevan \texttt{LIMIT} explícito para medir el barrido
 completo del rango sin el tope de seguridad de la consola.
 
-\begin{center}
+\begin{table}[!htb]
+\centering
+\caption{Experimento 3: búsquedas por rango con selectividad variable ($N = 100\,000$).}
+\label{tab:exp3}
 \small
-\begin{tabular}{lrrrr}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
-\textbf{Organización} & \textbf{Sel.\ \%} & \textbf{Tuplas} & \textbf{Reads prom.} & \textbf{ms prom.} \\
+\rowcolor{utecblue!10}\textbf{Organización} & \textbf{Sel.\ \%} & \textbf{Tuplas} & \textbf{Reads prom.} & \textbf{ms prom.} \\
 \midrule
 Heap sin índice & 0.1--25 & 100--25 000 & $1192 \pm 0$ & 178--212 \\
 \midrule
@@ -418,22 +551,26 @@ Sequential File & 10  & 10 000 & $396 \pm 1.5$  & $36.0 \pm 9.4$ \\
 Sequential File & 25  & 25 000 & $972 \pm 1.5$  & $103.8 \pm 14.6$ \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-\begin{center}
+\begin{figure}[!htb]
+\centering
 \begin{tikzpicture}
 \begin{semilogxaxis}[
+    estilodoc,
     width=0.85\textwidth, height=6.5cm,
     xlabel={Selectividad del rango (\% del total)},
     ylabel={Lecturas de bloques (prom.)},
-    legend pos=north west, grid=major, mark size=1.8pt]
+    legend pos=north west, grid=major]
 \addplot coordinates {(0.1,1192) (1,1192) (5,1192) (10,1192) (25,1192)};
 \addplot coordinates {(0.1,101.56) (1,686.28) (5,1196.64) (10,1228.52) (25,1278)};
 \addplot coordinates {(0.1,18.24) (1,51.42) (5,204.22) (10,396.02) (25,972.22)};
 \legend{Heap sin índice (scan), Heap + B+ Tree, Sequential File}
 \end{semilogxaxis}
 \end{tikzpicture}
-\end{center}
+\caption{Experimento 3: lecturas de bloques según la selectividad del rango (eje $x$ logarítmico).}
+\label{fig:exp3}
+\end{figure}
 
 \paragraph{Análisis: el punto de cruce.}
 El full scan es insensible a la selectividad (siempre 1192 páginas: hay que
@@ -466,11 +603,14 @@ búsquedas puntuales con la caché de nodos vaciada antes de cada consulta
 (peor caso: cada nivel del camino raíz$\to$hoja es una lectura física) y
 el tamaño total del archivo del índice.
 
-\begin{center}
+\begin{table}[!htb]
+\centering
+\caption{Experimento 4: sensibilidad del B+ Tree al tamaño de bloque $B$ ($N = 100\,000$ claves).}
+\label{tab:exp4}
 \small
-\begin{tabular}{rrrrrrr}
+\begin{tabular}{@{}rrrrrrr@{}}
 \toprule
-\textbf{$B$ (B)} & \textbf{Cap.\ hoja} & \textbf{Cap.\ interno} &
+\rowcolor{utecblue!10}\textbf{$B$ (B)} & \textbf{Cap.\ hoja} & \textbf{Cap.\ interno} &
 \textbf{Altura} & \textbf{Páginas} & \textbf{MiB} & \textbf{Reads prom.} \\
 \midrule
 1024 & 101 & 72  & 3 & 1449 & 1.42 & $3.03 \pm 0.16$ \\
@@ -479,18 +619,20 @@ el tamaño total del archivo del índice.
 8192 & 818 & 584 & 2 & 160  & 1.25 & $2.00 \pm 0.00$ \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-\begin{center}
+\begin{figure}[!htb]
+\centering
 \begin{minipage}{0.48\textwidth}
 \centering
 \begin{tikzpicture}
 \begin{loglogaxis}[
+    estilodoc,
     width=\textwidth, height=6cm,
     log basis x={2}, log basis y={2},
     xlabel={$B$ (bytes)}, ylabel={Capacidad (entradas/nodo)},
     xtick={1024,2048,4096,8192}, xticklabels={1K,2K,4K,8K},
-    legend pos=north west, grid=major, mark size=1.8pt]
+    legend pos=north west, grid=major]
 \addplot coordinates {(1024,72) (2048,145) (4096,292) (8192,584)};
 \addplot coordinates {(1024,101) (2048,203) (4096,408) (8192,818)};
 \legend{Nodo interno, Nodo hoja}
@@ -501,17 +643,20 @@ el tamaño total del archivo del índice.
 \centering
 \begin{tikzpicture}
 \begin{semilogxaxis}[
+    estilodoc,
     width=\textwidth, height=6cm,
     log basis x={2},
     xlabel={$B$ (bytes)}, ylabel={Altura $h$},
     xtick={1024,2048,4096,8192}, xticklabels={1K,2K,4K,8K},
     ytick={2,3}, ymin=1.5, ymax=3.5,
-    grid=major, mark size=1.8pt]
+    grid=major]
 \addplot coordinates {(1024,3) (2048,3) (4096,3) (8192,2)};
 \end{semilogxaxis}
 \end{tikzpicture}
 \end{minipage}
-\end{center}
+\caption{Experimento 4: capacidad por tipo de nodo (izquierda) y altura del B+ Tree (derecha) según $B$.}
+\label{fig:exp4}
+\end{figure}
 
 \paragraph{Análisis.}
 Duplicar $B$ duplica casi exactamente el fan-out: la capacidad del nodo
