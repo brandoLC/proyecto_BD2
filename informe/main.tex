@@ -213,7 +213,7 @@ reserva el directorio con capacidad fija desde el inicio (región
 \emph{sparse} vía \texttt{truncate}, sin costo físico hasta usarse), ubica
 cada bucket en un offset fijo (\texttt{bucket\_id} = posición física) y lee
 perezosamente: cabecera + 1 página de directorio + 1 página de bucket.
-Resultado medido: \textbf{5 lecturas y 0.47 ms} por búsqueda (sección 7.3).
+Resultado medido: \textbf{5 lecturas y 0.20 ms} por búsqueda (sección 7.3).
 El formato viejo no se soporta; los índices hash existentes se recrean.
 
 \subsection{R-Tree (extensión espacial)}
@@ -312,10 +312,10 @@ bloques de 4 KB y filas/segundo.
 \toprule
 \textbf{Organización} & $N{=}10^3$ & $N{=}10^4$ & $N{=}5\cdot10^4$ & $N{=}10^5$ \\
 \midrule
-Heap sin índice      & 0.008 & 0.079 & 0.412 & 0.819 \\
-Heap + B+ Tree (PK)  & 0.037 & 0.442 & 2.929 & 7.075 \\
-Heap + Hash Ext.\ (PK) & 0.030 & 0.356 & 2.220 & 5.245 \\
-Sequential File      & 0.013 & 0.126 & 0.646 & 1.275 \\
+Heap sin índice      & 0.004 & 0.045 & 0.228 & 0.476 \\
+Heap + B+ Tree (PK)  & 0.019 & 0.234 & 1.404 & 3.590 \\
+Heap + Hash Ext.\ (PK) & 0.016 & 0.195 & 1.094 & 2.545 \\
+Sequential File      & 0.006 & 0.066 & 0.334 & 0.674 \\
 \bottomrule
 \end{tabular}
 
@@ -329,28 +329,28 @@ Sequential File      & 0.013 & 0.126 & 0.646 & 1.275 \\
     width=0.85\textwidth, height=6.5cm,
     xlabel={$N$ (registros)}, ylabel={Tiempo total (s)},
     legend pos=north west, grid=major, mark size=1.8pt]
-\addplot coordinates {(1000,0.008) (10000,0.079) (50000,0.412) (100000,0.819)};
-\addplot coordinates {(1000,0.037) (10000,0.442) (50000,2.929) (100000,7.075)};
-\addplot coordinates {(1000,0.030) (10000,0.356) (50000,2.220) (100000,5.245)};
-\addplot coordinates {(1000,0.013) (10000,0.126) (50000,0.646) (100000,1.275)};
+\addplot coordinates {(1000,0.004) (10000,0.045) (50000,0.228) (100000,0.476)};
+\addplot coordinates {(1000,0.019) (10000,0.234) (50000,1.404) (100000,3.590)};
+\addplot coordinates {(1000,0.016) (10000,0.195) (50000,1.094) (100000,2.545)};
+\addplot coordinates {(1000,0.006) (10000,0.066) (50000,0.334) (100000,0.674)};
 \legend{Heap sin índice, Heap + B+ Tree, Heap + Hash Ext., Sequential File}
 \end{loglogaxis}
 \end{tikzpicture}
 \end{center}
 
-Para $N = 100\,000$, las escrituras de bloques fueron: heap 1178, B+ Tree
-1529, Hash 1436 y Sequential 1432 (122 132, 14 135, 19 068 y 78 458
+Para $N = 100\,000$, las escrituras de bloques fueron: heap 1192, B+ Tree
+1543, Hash 1450 y Sequential 1432 (210 168, 27 857, 39 287 y 148 331
 filas/s respectivamente).
 
 \paragraph{Análisis.}
 El heap pelado es el límite inferior teórico: escribe cada página de datos
-una sola vez (1178 escrituras $\approx$ $N \cdot 48$ B $/ 4096$ B) y su
-throughput es constante ($\sim$120k filas/s en todo el rango), es decir
+una sola vez (1192 escrituras $\approx$ $N \cdot 48$ B $/ 4096$ B) y su
+throughput es constante ($\sim$220k filas/s en todo el rango), es decir
 $O(1)$ amortizado por tupla. Los índices pagan el mantenimiento de la
-estructura: el B+ Tree escribe $\sim$30\% más bloques y es $8.6\times$ más
+estructura: el B+ Tree escribe $\sim$30\% más bloques y es $7.5\times$ más
 lento en tiempo a $N{=}10^5$ (splits y propagación, $O(\log N)$ por tupla);
 el hash queda intermedio. El Sequential File con carga ordenada es el
-segundo más rápido (1.28 s): gracias al puntero \texttt{tail} persistido,
+segundo más rápido (0.67 s): gracias al puntero \texttt{tail} persistido,
 cada inserción es $O(1)$ y solo escribe páginas del área de overflow; sin
 ese camino rápido la inserción ordenada recorrería la cadena y degradaría a
 $O(N^2)$.
@@ -359,29 +359,29 @@ $O(N^2)$.
 
 Búsquedas de igualdad \texttt{WHERE id = k} sobre $N = 100\,000$ registros,
 con claves aleatorias existentes (1000 consultas; 100 para el full scan por
-su costo de $\sim$0.3 s por consulta).
+su costo de $\sim$0.2 s por consulta).
 
 \begin{center}
 \begin{tabular}{lrrr}
 \toprule
 \textbf{Organización} & \textbf{Reads prom.} & \textbf{Latencia prom.\ (ms)} \\
 \midrule
-Heap sin índice (full scan) & $1178 \pm 0$    & $328.2 \pm 24.6$ \\
-Heap + B+ Tree (PK)         & $6.01 \pm 0.09$ & $0.58 \pm 0.11$ \\
-Heap + Hash Ext.\ (PK)      & $5 \pm 0$       & $0.47 \pm 0.09$ \\
-Sequential File (binaria)   & $16.94 \pm 0.26$ & $0.55 \pm 0.11$ \\
+Heap sin índice (full scan) & $1192 \pm 0$    & $183.5 \pm 9.4$ \\
+Heap + B+ Tree (PK)         & $6.01 \pm 0.09$ & $0.26 \pm 0.03$ \\
+Heap + Hash Ext.\ (PK)      & $5 \pm 0$       & $0.20 \pm 0.02$ \\
+Sequential File (binaria)   & $16.94 \pm 0.26$ & $0.24 \pm 0.02$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \paragraph{Análisis.}
-Los números replican la teoría casi exactamente. El full scan lee las 1178
+Los números replican la teoría casi exactamente. El full scan lee las 1192
 páginas de datos en \emph{todas} las consultas ($O(P)$, std = 0: no depende
 de la clave). El B+ Tree lee $O(\log N)$: cabecera + camino raíz$\to$hoja
 (2 niveles bastan para 100k claves de 4 B) + cabecera del heap + 1 página de
 datos = 6 bloques. El hash gana la igualdad con $O(1)$: cabecera + 1 página
 de directorio + 1 página de bucket + 2 del heap = 5 bloques y la menor
-latencia (0.47 ms) — el acceso es directo por función hash, sin
+latencia (0.20 ms) — el acceso es directo por función hash, sin
 comparaciones en niveles intermedios. La búsqueda binaria del Sequential
 File cuesta $\sim$17 lecturas ($\log_2 P$ páginas de la principal más la
 caminata corta y el fetch), ligeramente por encima del B+ Tree porque la
@@ -403,19 +403,19 @@ completo del rango sin el tope de seguridad de la consola.
 \toprule
 \textbf{Organización} & \textbf{Sel.\ \%} & \textbf{Tuplas} & \textbf{Reads prom.} & \textbf{ms prom.} \\
 \midrule
-Heap sin índice & 0.1--25 & 100--25 000 & $1178 \pm 0$ & 300--372 \\
+Heap sin índice & 0.1--25 & 100--25 000 & $1192 \pm 0$ & 178--212 \\
 \midrule
-Heap + B+ Tree & 0.1 & 100    & $101 \pm 1.8$   & $5.6 \pm 4.5$ \\
-Heap + B+ Tree & 1   & 1 000  & $686 \pm 8.9$   & $45.2 \pm 13.9$ \\
-Heap + B+ Tree & 5   & 5 000  & $1183 \pm 5.0$  & $97.0 \pm 18.6$ \\
-Heap + B+ Tree & 10  & 10 000 & $1215 \pm 4.0$  & $122.9 \pm 19.8$ \\
-Heap + B+ Tree & 25  & 25 000 & $1264 \pm 6.0$  & $207.3 \pm 18.0$ \\
+Heap + B+ Tree & 0.1 & 100    & $102 \pm 1.7$   & $3.2 \pm 3.5$ \\
+Heap + B+ Tree & 1   & 1 000  & $686 \pm 10.3$  & $22.2 \pm 8.8$ \\
+Heap + B+ Tree & 5   & 5 000  & $1197 \pm 4.8$  & $50.9 \pm 12.3$ \\
+Heap + B+ Tree & 10  & 10 000 & $1229 \pm 4.1$  & $66.3 \pm 13.5$ \\
+Heap + B+ Tree & 25  & 25 000 & $1278 \pm 6.0$  & $111.7 \pm 11.9$ \\
 \midrule
-Sequential File & 0.1 & 100    & $18 \pm 0.6$   & $0.96 \pm 0.08$ \\
-Sequential File & 1   & 1 000  & $51 \pm 1.2$   & $5.3 \pm 0.3$ \\
-Sequential File & 5   & 5 000  & $204 \pm 1.5$  & $33.1 \pm 11.7$ \\
-Sequential File & 10  & 10 000 & $396 \pm 1.5$  & $73.1 \pm 16.7$ \\
-Sequential File & 25  & 25 000 & $972 \pm 1.5$  & $202.8 \pm 21.1$ \\
+Sequential File & 0.1 & 100    & $18 \pm 0.6$   & $0.52 \pm 0.04$ \\
+Sequential File & 1   & 1 000  & $51 \pm 1.2$   & $3.3 \pm 2.6$ \\
+Sequential File & 5   & 5 000  & $204 \pm 1.5$  & $17.0 \pm 6.4$ \\
+Sequential File & 10  & 10 000 & $396 \pm 1.5$  & $36.0 \pm 9.4$ \\
+Sequential File & 25  & 25 000 & $972 \pm 1.5$  & $103.8 \pm 14.6$ \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -427,8 +427,8 @@ Sequential File & 25  & 25 000 & $972 \pm 1.5$  & $202.8 \pm 21.1$ \\
     xlabel={Selectividad del rango (\% del total)},
     ylabel={Lecturas de bloques (prom.)},
     legend pos=north west, grid=major, mark size=1.8pt]
-\addplot coordinates {(0.1,1178) (1,1178) (5,1178) (10,1178) (25,1178)};
-\addplot coordinates {(0.1,101.3) (1,685.76) (5,1183.34) (10,1214.62) (25,1264)};
+\addplot coordinates {(0.1,1192) (1,1192) (5,1192) (10,1192) (25,1192)};
+\addplot coordinates {(0.1,101.56) (1,686.28) (5,1196.64) (10,1228.52) (25,1278)};
 \addplot coordinates {(0.1,18.24) (1,51.42) (5,204.22) (10,396.02) (25,972.22)};
 \legend{Heap sin índice (scan), Heap + B+ Tree, Sequential File}
 \end{semilogxaxis}
@@ -436,22 +436,22 @@ Sequential File & 25  & 25 000 & $972 \pm 1.5$  & $202.8 \pm 21.1$ \\
 \end{center}
 
 \paragraph{Análisis: el punto de cruce.}
-El full scan es insensible a la selectividad (siempre 1178 páginas: hay que
+El full scan es insensible a la selectividad (siempre 1192 páginas: hay que
 barrer todo el archivo). El B+ Tree degrada con el tamaño del rango porque
 los RIDs que devuelve están \emph{dispersos} por todo el heap (la carga fue
 desordenada): cada tupla del rango puede tocar una página de datos distinta.
 El \textbf{punto de cruce en I/O está entre 1\% y 5\%}: a 1\% el índice lee
-686 páginas y gana claramente; a 5\% lee 1183, ya \emph{más} que barrer el
-archivo completo. En latencia el scan nunca gana en este experimento (207 ms
-del B+ Tree vs 372 ms del scan a 25\%) porque el scan además deserializa las
+686 páginas y gana claramente; a 5\% lee 1197, ya \emph{más} que barrer el
+archivo completo. En latencia el scan nunca gana en este experimento (112 ms
+del B+ Tree vs 212 ms del scan a 25\%) porque el scan además deserializa las
 100 000 tuplas: el CPU de deserialización domina sobre la I/O extra — un
 matiz útil: el cruce en bloques no implica cruce en tiempo cuando el plan
 alternativo paga CPU por tupla. El Sequential File domina los rangos en toda
 selectividad medida: al ser una organización \emph{clustered} el rango es
 físicamente contiguo, así que sus lecturas escalan con la fracción del
 archivo ($972 \approx 82\%$ de las páginas a 25\%, por el fill factor del
-75\%) sin saltos; a 0.1\% es $5.5\times$ más económico que el B+ Tree (18 vs
-101 lecturas). Es la confirmación experimental de por qué los rangos sobre
+75\%) sin saltos; a 0.1\% es $5.6\times$ más económico que el B+ Tree (18 vs
+102 lecturas). Es la confirmación experimental de por qué los rangos sobre
 la clave de clustering son el caso ideal de las organizaciones ordenadas.
 
 \subsection{Experimento 4: sensibilidad al tamaño de bloque}
@@ -474,7 +474,7 @@ el tamaño total del archivo del índice.
 \textbf{Altura} & \textbf{Páginas} & \textbf{MiB} & \textbf{Reads prom.} \\
 \midrule
 1024 & 101 & 72  & 3 & 1449 & 1.42 & $3.03 \pm 0.16$ \\
-2048 & 203 & 145 & 3 & 718  & 1.40 & $3.01 \pm 0.10$ \\
+2048 & 203 & 145 & 3 & 708  & 1.38 & $3.01 \pm 0.11$ \\
 4096 & 408 & 292 & 3 & 351  & 1.37 & $3.01 \pm 0.08$ \\
 8192 & 818 & 584 & 2 & 160  & 1.25 & $2.00 \pm 0.00$ \\
 \bottomrule
@@ -492,7 +492,7 @@ el tamaño total del archivo del índice.
     xtick={1024,2048,4096,8192}, xticklabels={1K,2K,4K,8K},
     legend pos=north west, grid=major, mark size=1.8pt]
 \addplot coordinates {(1024,72) (2048,145) (4096,292) (8192,584)};
-\addplot coordinates {(1024,101) (2048,204) (4096,408) (8192,818)};
+\addplot coordinates {(1024,101) (2048,203) (4096,408) (8192,818)};
 \legend{Nodo interno, Nodo hoja}
 \end{loglogaxis}
 \end{tikzpicture}
@@ -529,8 +529,8 @@ que el costo de la igualdad es exactamente $\Theta(h)$ y que achatar el
 árbol con páginas grandes se traduce en I/O real ahorrada. El tamaño del
 índice es prácticamente constante ($1.25$--$1.42$ MiB): las páginas
 grandes amortiguan cabeceras (160 páginas vs 1449 para la misma
-información). El costo aparece del otro lado: la carga tarda $8.3$ s con
-8 KB frente a $3.2$ s con 1 KB (serializar y escribir nodos de 8 KB por
+información). El costo aparece del otro lado: la carga tarda $3.7$ s con
+8 KB frente a $1.6$ s con 1 KB (serializar y escribir nodos de 8 KB por
 split es más caro) y, en un sistema real, leer un bloque de 8 KB para
 usar una entrada de 14 B desperdicia ancho de banda si la carga es de
 búsquedas puntuales. La elección de $B$ es entonces un compromiso entre
@@ -541,12 +541,12 @@ página del sistema operativo y equilibra ambos extremos.
 
 \begin{itemize}
   \item Las complejidades teóricas se verificaron experimentalmente con I/O
-        física real: $O(P)$ del scan (1178 lecturas constantes), $O(\log N)$
+        física real: $O(P)$ del scan (1192 lecturas constantes), $O(\log N)$
         del B+ Tree (6 lecturas), $O(1)$ del hash extensible (5 lecturas) y
         búsqueda binaria del archivo secuencial ($\sim$17 lecturas).
   \item El formato de persistencia importa tanto como la estructura de
         datos: reescribir el índice hash completo por operación lo hacía
-        $127\times$ más lento en lectura que su versión paginada perezosa.
+        $\sim$$300\times$ más lento en lectura que su versión paginada perezosa.
   \item No hay estructura universalmente mejor: el heap gana en inserción,
         el hash en igualdad, el B+ Tree equilibra igualdad y rangos
         moderados, y el archivo secuencial domina los rangos gracias a la
