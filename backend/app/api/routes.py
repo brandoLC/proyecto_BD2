@@ -59,7 +59,14 @@ def query(req: QueryRequest):
     if not req.sql or not req.sql.strip():
         return {"ok": False, "error": "la sentencia SQL está vacía",
                 "stage": "parse"}
-    result = engine.execute(req.sql)
+    try:
+        result = engine.execute(req.sql)
+    except Exception as exc:
+        # Excepción no prevista del motor (bug, recurso agotado, ...):
+        # mismo contrato {ok, error, stage} que el resto de errores en
+        # vez de un HTTP 500 pelado.
+        return {"ok": False, "error": f"error interno del motor: {exc}",
+                "stage": "execution"}
     if (not result.get("ok") and result.get("stage") == "semantic"
             and "ya existe" in result.get("error", "")):
         # Tabla (o índice) ya existente: conflicto 4xx con el mismo cuerpo

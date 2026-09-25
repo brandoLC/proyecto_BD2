@@ -46,6 +46,92 @@ class TestExtendibleHash:
                 h.insert(7, (i, 0))
             assert set(h.search(7)) == {(i, 0) for i in range(10)}
 
+    def test_cientos_de_duplicados_misma_clave(self, tmp_path):
+        """Más duplicados de una clave que la capacidad del bucket: cadena
+        de overflow SIN disparar la profundidad global (regresión del
+        OverflowError de EXH2)."""
+        with make_hash(tmp_path) as h:
+            assert 600 > h.bucket_cap
+            for i in range(600):
+                h.insert(7, (i, i % 4))
+            assert set(h.search(7)) == {(i, i % 4) for i in range(600)}
+            # Sin splits: el directorio no crece nada.
+            assert h.global_depth == 1
+            # 600 entradas en cadenas de ~cap: unas pocas páginas extra.
+            assert h.num_buckets <= 2 + 600 // h.bucket_cap + 1
+
+    def test_delete_a_traves_de_la_cadena(self, tmp_path):
+        """Los borrados atraviesan los buckets de overflow; un overflow que
+        queda vacío se desenlaza de la cadena."""
+        with make_hash(tmp_path) as h:
+            for i in range(600):
+                h.insert(7, (i, 0))
+            n0 = h.num_buckets
+            # Borrar la mitad, repartida por toda la cadena.
+            for i in range(0, 600, 2):
+                h.delete(7, (i, 0))
+            assert set(h.search(7)) == {(i, 0) for i in range(1, 600, 2)}
+            with pytest.raises(KeyError):
+                h.delete(7, (0, 0))
+            # Vaciar del todo: la cadena se desenlaza (solo queda el
+            # bucket primario alcanzable).
+            for i in range(1, 600, 2):
+                h.delete(7, (i, 0))
+            assert h.search(7) == []
+            assert h._read_bucket(h._bucket_id_for(7)).next == 0xFFFFFFFF
+            assert h.num_buckets == n0  # las páginas desenlazadas no se reciclan
+
+    def test_duplicados_con_splits_y_persistencia(self, tmp_path):
+        """Duplicados concentrados + claves normales que fuerzan splits,
+        con cierre y reapertura del archivo."""
+        rng = random.Random(21)
+        keys = rng.sample(range(50_000), 800)
+        path = str(tmp_path / "t.hash")
+        with ExtendibleHash(path, 4, lambda v: struct.pack("<i", v),
+                            lambda b: struct.unpack("<i", b)[0],
+                            create=True) as h:
+            # Intercalar duplicados de una misma clave con claves normales.
+            for i, k in enumerate(keys):
+                h.insert(k, (i, 5))
+                if i % 4 == 0:
+                    h.insert(7, (i, 1))  # 200 duplicados de la clave 7
+            assert h.global_depth > 1  # los splits normales siguen ocurriendo
+            depth = h.global_depth
+            for i, k in enumerate(keys):
+                assert h.search(k) == [(i, 5)]
+            assert set(h.search(7)) == {(i, 1) for i in range(0, 800, 4)}
+        with ExtendibleHash(path, 4, lambda v: struct.pack("<i", v),
+                            lambda b: struct.unpack("<i", b)[0]) as h:
+            assert h.global_depth == depth
+            for i, k in enumerate(keys):
+                assert h.search(k) == [(i, 5)]
+            assert set(h.search(7)) == {(i, 1) for i in range(0, 800, 4)}
+            # Borrado de duplicados tras reabrir (cadena leída de disco).
+            for i in range(0, 800, 8):
+                h.delete(7, (i, 1))
+            assert set(h.search(7)) == {(i, 1) for i in range(4, 800, 8)}
+
+    def test_busqueda_en_cadena_lee_un_bloque_por_pagina(self, tmp_path):
+        """Cada página de overflow cuenta 1 bloque de I/O: búsqueda en frío
+        = cabecera + directorio + páginas de la cadena."""
+        from app.storage.disk_counter import DiskCounter
+        path = str(tmp_path / "t.hash")
+        with ExtendibleHash(path, 4, lambda v: struct.pack("<i", v),
+                            lambda b: struct.unpack("<i", b)[0],
+                            create=True) as h:
+            h.defer_flush = True
+            for i in range(600):
+                h.insert(7, (i, 0))
+            h.flush()
+            cap = h.bucket_cap
+        chain = (600 + cap - 1) // cap
+        counter = DiskCounter()
+        with ExtendibleHash(path, 4, lambda v: struct.pack("<i", v),
+                            lambda b: struct.unpack("<i", b)[0],
+                            counter=counter) as h:
+            assert len(h.search(7)) == 600
+            assert counter.reads == 2 + chain  # cabecera + dir + cadena
+
     def test_entrada_duplicada_falla(self, tmp_path):
         with make_hash(tmp_path) as h:
             h.insert(1, (1, 1))

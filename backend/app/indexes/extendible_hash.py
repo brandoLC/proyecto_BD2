@@ -1,6 +1,6 @@
 """Hash extensible (extendible hashing) con acceso perezoso por páginas.
 
-Formato EXH2 del archivo (páginas de 4 KB):
+Formato EXH3 del archivo (páginas de 4 KB):
 
 - Página 0: cabecera (magic, global_depth, num_buckets, key_size).
 - Páginas 1..1024: DIRECTORIO con capacidad reservada fija para
@@ -12,17 +12,40 @@ Formato EXH2 del archivo (páginas de 4 KB):
   en archivo aparte): el ``bucket_id`` ES la posición física del bucket
   y nunca cambia.
 - Página ``BUCKET_PAGE_BASE + bucket_id``: una página por bucket, en
-  offset fijo.
+  offset fijo. Los ``bucket_id`` se asignan en orden creciente
+  (``num_buckets`` actúa de puntero de arena); un ``bucket_id``
+  consumido nunca se reutiliza.
+
+Manejo de duplicados (buckets de overflow encadenados):
+
+Un split solo es útil si separa las claves del bucket; cuando TODAS
+las claves de un bucket lleno comparten los mismos
+``MAX_GLOBAL_DEPTH`` bits bajos de su hash (en la práctica: la misma
+clave repetida más veces que la capacidad del bucket), ningún split
+las separaría y duplicar el directorio solo lo haría crecer hasta el
+tope. En ese caso, en vez de dividir, el bucket encadena páginas de
+OVERFLOW: la cabecera de cada bucket lleva un puntero ``next``
+(bucket_id del siguiente eslabón, o ``NO_OVERFLOW``) y el duplicado se
+inserta en el primer eslabón con espacio (o en una página nueva al
+final de la cadena). Las páginas de overflow no aparecen en el
+directorio: solo se alcanzan siguiendo la cadena desde el bucket
+primario. ``search`` y ``delete`` recorren la cadena completa; un
+bucket de overflow que queda totalmente vacío tras un borrado se
+DESENLAZA de la cadena, pero su página no se reutiliza (los
+``bucket_id`` no se reciclan) hasta recrear el índice.
 
 Coste por operación (instancia fría): una búsqueda puntual lee la
-cabecera + 1 página de directorio + 1 página de bucket (~3 bloques);
-una inserción reescribe solo la página del bucket afectado (+ las
-páginas de directorio que cambian en un split, y la cabecera cuando
-cambia la profundidad o el número de buckets).
+cabecera + 1 página de directorio + las páginas de la cadena del
+bucket (1 si no hay overflow); una inserción reescribe solo la página
+del bucket afectado (+ las páginas de directorio que cambian en un
+split, y la cabecera cuando cambia la profundidad o el número de
+buckets).
 
-El formato EXH1 anterior (cargaba todo el archivo a memoria al abrir y
-lo reescribía completo en cada mutación) NO se soporta: los índices
-hash existentes deben recrearse (DROP TABLE / CREATE INDEX).
+Los formatos EXH1 (cargaba todo el archivo a memoria al abrir y lo
+reescribía completo en cada mutación) y EXH2 (sin overflow: los
+duplicados concentrados agotaban la profundidad global) NO se
+soportan: los índices hash existentes deben recrearse (DROP TABLE /
+CREATE INDEX).
 
 Función hash: FNV-1a de 32 bits implementada a mano sobre los bytes de
 la clave codificada (sin librerías externas).
@@ -36,13 +59,16 @@ import struct
 from ..storage.disk_counter import CountedFile, DiskCounter
 from ..storage.page import PAGE_SIZE
 
-MAGIC = b"EXH2"
-OLD_MAGIC = b"EXH1"
+MAGIC = b"EXH3"
+OLD_MAGICS = (b"EXH1", b"EXH2")
 HEADER_FMT = "<4sBII"  # magic, global_depth, num_buckets, key_size
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
-BUCKET_HEADER_FMT = "<BH"  # local_depth, count
+BUCKET_HEADER_FMT = "<BHI"  # local_depth, count, next (cadena de overflow)
 BUCKET_HEADER_SIZE = struct.calcsize(BUCKET_HEADER_FMT)
+
+# Centinela de fin de cadena de overflow (bucket_id 0 es válido).
+NO_OVERFLOW = 0xFFFFFFFF
 
 RID_FMT = "<IH"
 RID_SIZE = struct.calcsize(RID_FMT)
@@ -68,12 +94,13 @@ def fnv1a_32(data: bytes) -> int:
 
 
 class _Bucket:
-    __slots__ = ("local_depth", "keys", "rids")
+    __slots__ = ("local_depth", "keys", "rids", "next")
 
     def __init__(self, local_depth: int) -> None:
         self.local_depth = local_depth
         self.keys: list = []
         self.rids: list[RID] = []
+        self.next = NO_OVERFLOW
 
 
 class ExtendibleHash:
@@ -133,10 +160,11 @@ class ExtendibleHash:
         self._file.seek(0)
         data = self._file.read(PAGE_SIZE)
         if len(data) < PAGE_SIZE or data[:4] != MAGIC:
-            if data[:4] == OLD_MAGIC:
+            if data[:4] in OLD_MAGICS:
                 raise ValueError(
-                    f"{self.path} usa el formato EXH1 (carga completa en "
-                    f"memoria); recrea el índice para migrarlo a EXH2")
+                    f"{self.path} usa el formato {data[:4].decode()}, que "
+                    f"ya no se soporta; recrea el índice para migrarlo a "
+                    f"{MAGIC.decode()}")
             raise ValueError(f"{self.path} no es un archivo hash válido")
         _, self.global_depth, self.num_buckets, ks = struct.unpack_from(
             HEADER_FMT, data, 0)
@@ -207,8 +235,10 @@ class ExtendibleHash:
                 self._evict_buckets()
             self._file.seek(self._bucket_page_id(bucket_id) * PAGE_SIZE)
             data = self._file.read(PAGE_SIZE)
-            local_depth, count = struct.unpack_from(BUCKET_HEADER_FMT, data, 0)
+            local_depth, count, next_id = struct.unpack_from(
+                BUCKET_HEADER_FMT, data, 0)
             bucket = _Bucket(local_depth)
+            bucket.next = next_id
             pos = BUCKET_HEADER_SIZE
             for _ in range(count):
                 bucket.keys.append(self.decode(data[pos : pos + self.key_size]))
@@ -228,7 +258,8 @@ class ExtendibleHash:
         bucket = self._bucket_cache[bucket_id]
         buf = bytearray(PAGE_SIZE)
         struct.pack_into(
-            BUCKET_HEADER_FMT, buf, 0, bucket.local_depth, len(bucket.keys))
+            BUCKET_HEADER_FMT, buf, 0, bucket.local_depth,
+            len(bucket.keys), bucket.next)
         pos = BUCKET_HEADER_SIZE
         for key, rid in zip(bucket.keys, bucket.rids):
             buf[pos : pos + self.key_size] = self.encode(key)
@@ -282,19 +313,92 @@ class ExtendibleHash:
     def _bucket_id_for(self, key) -> int:
         return self._dir_get(self._dir_index(self._hash(key)))
 
+    def _chain(self, bucket_id: int):
+        """Itera ``(bucket_id, bucket)`` desde el bucket primario hasta el
+        final de su cadena de overflow (un solo eslabón si no hay)."""
+        bid = bucket_id
+        while bid != NO_OVERFLOW:
+            bucket = self._read_bucket(bid)
+            yield bid, bucket
+            bid = bucket.next
+
+    def _separable(self, bucket: _Bucket) -> bool:
+        """True si algún split puede repartir las claves del bucket.
+
+        Si todas las claves comparten los ``MAX_GLOBAL_DEPTH`` bits bajos
+        de su hash (el caso típico: la misma clave repetida), ninguna
+        profundidad las separa y dividir solo duplicaría el directorio.
+        """
+        p0 = self._hash(bucket.keys[0]) & ((1 << MAX_GLOBAL_DEPTH) - 1)
+        return any(
+            (self._hash(k) & ((1 << MAX_GLOBAL_DEPTH) - 1)) != p0
+            for k in bucket.keys[1:])
+
+    def _alloc_overflow(self) -> tuple[int, _Bucket]:
+        """Aloca una página de overflow con el mismo mecanismo de arena
+        que los buckets de un split (``num_buckets`` como puntero)."""
+        new_id = self.num_buckets
+        self.num_buckets += 1
+        self._header_dirty = True
+        return new_id, _Bucket(0)
+
+    def _insert_overflow(self, bucket_id: int, key, rid: RID) -> None:
+        """Inserta en la cadena de overflow del bucket lleno ``bucket_id``:
+        en el primer eslabón con espacio, o en una página nueva al final."""
+        for bid, bucket in self._chain(bucket_id):
+            if len(bucket.keys) < self.bucket_cap:
+                bucket.keys.append(key)
+                bucket.rids.append(rid)
+                self._store_bucket(bid, bucket)
+                self._commit()
+                return
+            tail_id, tail = bid, bucket
+        new_id, new_bucket = self._alloc_overflow()
+        new_bucket.keys.append(key)
+        new_bucket.rids.append(rid)
+        tail.next = new_id
+        self._store_bucket(tail_id, tail)
+        self._store_bucket(new_id, new_bucket)
+        self._commit()
+
+    def _spill_excess(self, bucket_id: int, bucket: _Bucket) -> None:
+        """Mueve a páginas de overflow encadenadas las entradas que
+        exceden la capacidad del bucket (tras redistribuir un split)."""
+        bid, b = bucket_id, bucket
+        while len(b.keys) > self.bucket_cap:
+            new_id, ovf = self._alloc_overflow()
+            ovf.next = b.next
+            ovf.keys = b.keys[self.bucket_cap:]
+            ovf.rids = b.rids[self.bucket_cap:]
+            del b.keys[self.bucket_cap:]
+            del b.rids[self.bucket_cap:]
+            b.next = new_id
+            self._store_bucket(bid, b)
+            self._store_bucket(new_id, ovf)
+            bid, b = new_id, ovf
+
     def insert(self, key, rid: RID) -> None:
         entry = (key, rid)
         idx = self._dir_index(self._hash(key))
         bucket_id = self._dir_get(idx)
         bucket = self._read_bucket(bucket_id)
-        for k, r in zip(bucket.keys, bucket.rids):
-            if (k, r) == entry:
-                raise KeyError(f"entrada duplicada: {key!r} {rid}")
+        # La entrada exacta no debe repetirse en NINGÚN eslabón de la cadena.
+        for _bid, b in self._chain(bucket_id):
+            for k, r in zip(b.keys, b.rids):
+                if (k, r) == entry:
+                    raise KeyError(f"entrada duplicada: {key!r} {rid}")
         if len(bucket.keys) < self.bucket_cap:
             bucket.keys.append(key)
             bucket.rids.append(rid)
             self._store_bucket(bucket_id, bucket)
             self._commit()
+            return
+
+        if not self._separable(bucket):
+            # Bucket lleno de claves con el mismo prefijo de hash (típicamente
+            # la MISMA clave): el split no las separaría y el directorio
+            # crecería hasta el tope. Cadena de overflow en su lugar.
+            self._insert_overflow(bucket_id, key, rid)
             return
 
         # Overflow: split del bucket (duplicando el directorio si hace falta)
@@ -320,9 +424,15 @@ class ExtendibleHash:
         for i in range(pattern | bit, 1 << self.global_depth, step):
             self._dir_set(i, new_id)
 
-        # Redistribuir las entradas entre el bucket viejo y el nuevo.
-        old_entries = list(zip(bucket.keys, bucket.rids))
+        # Redistribuir las entradas de TODA la cadena (primario + overflows,
+        # si el bucket encadenó duplicados antes de volverse separable)
+        # entre el bucket viejo y el nuevo; las páginas de overflow viejas
+        # quedan desenlazadas (su espacio no se reutiliza).
+        old_entries = []
+        for _bid, b in self._chain(bucket_id):
+            old_entries.extend(zip(b.keys, b.rids))
         bucket.keys, bucket.rids = [], []
+        bucket.next = NO_OVERFLOW
         for k, r in old_entries:
             target = (new_bucket if self._bucket_id_for(k) == new_id
                       else bucket)
@@ -330,6 +440,10 @@ class ExtendibleHash:
             target.rids.append(r)
         self._store_bucket(bucket_id, bucket)
         self._store_bucket(new_id, new_bucket)
+        # Si un lado recibió más entradas de su capacidad (duplicados
+        # concentrados), el excedente vuelve a una cadena de overflow.
+        self._spill_excess(bucket_id, bucket)
+        self._spill_excess(new_id, new_bucket)
         self._commit()
 
     def _double_directory(self) -> None:
@@ -344,22 +458,37 @@ class ExtendibleHash:
             self._dir_set(old_len + i, self._dir_get(i))
 
     def search(self, key) -> list[RID]:
-        """Devuelve todos los RIDs asociados a ``key``."""
-        bucket = self._read_bucket(self._bucket_id_for(key))
-        return [r for k, r in zip(bucket.keys, bucket.rids) if k == key]
+        """Devuelve todos los RIDs asociados a ``key`` (recorre la cadena
+        de overflow completa del bucket)."""
+        out: list[RID] = []
+        for _bid, bucket in self._chain(self._bucket_id_for(key)):
+            out.extend(r for k, r in zip(bucket.keys, bucket.rids)
+                       if k == key)
+        return out
 
     def delete(self, key, rid: RID) -> None:
-        bucket_id = self._bucket_id_for(key)
-        bucket = self._read_bucket(bucket_id)
-        entries = list(zip(bucket.keys, bucket.rids))
-        try:
-            entries.remove((key, rid))
-        except ValueError:
-            raise KeyError(f"entrada no encontrada: {key!r} {rid}") from None
-        bucket.keys = [k for k, _ in entries]
-        bucket.rids = [r for _, r in entries]
-        self._store_bucket(bucket_id, bucket)
-        self._commit()
+        prev_id = NO_OVERFLOW
+        prev = None
+        for bid, bucket in self._chain(self._bucket_id_for(key)):
+            entries = list(zip(bucket.keys, bucket.rids))
+            try:
+                entries.remove((key, rid))
+            except ValueError:
+                prev_id, prev = bid, bucket
+                continue
+            bucket.keys = [k for k, _ in entries]
+            bucket.rids = [r for _, r in entries]
+            self._store_bucket(bid, bucket)
+            if prev is not None and not bucket.keys:
+                # Un bucket de OVERFLOW que queda vacío se desenlaza de la
+                # cadena (el primario no: el directorio apunta a él). La
+                # página desenlazada no se reutiliza hasta recrear el
+                # índice: los bucket_id no se reciclan.
+                prev.next = bucket.next
+                self._store_bucket(prev_id, prev)
+            self._commit()
+            return
+        raise KeyError(f"entrada no encontrada: {key!r} {rid}")
 
     def close(self) -> None:
         self.flush()
