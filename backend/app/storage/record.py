@@ -7,6 +7,7 @@ Mapeo de tipos a códigos de formato:
 - ``BOOL``       -> ``?`` (1 byte)
 - ``VARCHAR(n)`` -> ``{n}s`` (n bytes, padding con NUL)
 - ``POINT``      -> ``dd`` (dos floats x, y)
+- ``VECTOR(n)``  -> ``{n}f`` (n floats IEEE-754 de 32 bits)
 - ``TEXT``       -> prefijo de longitud ``H`` seguido de los bytes
 
 Si la tabla no tiene columnas ``TEXT`` el registro es de longitud fija.
@@ -25,6 +26,7 @@ TYPE_BOOL = "BOOL"
 TYPE_VARCHAR = "VARCHAR"
 TYPE_TEXT = "TEXT"
 TYPE_POINT = "POINT"
+TYPE_VECTOR = "VECTOR"
 
 SCALAR_TYPES = {TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_VARCHAR, TYPE_TEXT}
 
@@ -45,6 +47,8 @@ class Column:
     def type_str(self) -> str:
         if self.type == TYPE_VARCHAR:
             return f"VARCHAR({self.size})"
+        if self.type == TYPE_VECTOR:
+            return f"VECTOR({self.size})"
         if self.auto:
             return "SERIAL"
         return self.type
@@ -73,6 +77,38 @@ class SerializationError(Exception):
     """Valor incompatible con el tipo de la columna."""
 
 
+def coerce_vector(value, col: Column) -> tuple[float, ...]:
+    """Valida/coerce un vector a ``n`` floats.
+
+    Acepta una secuencia de números o un literal de texto estilo
+    pgvector: ``'[0.12, -0.34, 0.56]'``. La dimensión debe coincidir
+    exactamente con el ``VECTOR(n)`` declarado.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        try:
+            parts = [p for p in text.replace(" ", "").split(",") if p]
+            vec = tuple(float(p) for p in parts)
+        except ValueError as exc:
+            raise SerializationError(
+                f"literal de vector inválido en columna '{col.name}': "
+                f"{value!r}") from exc
+    else:
+        try:
+            vec = tuple(float(x) for x in value)
+        except (TypeError, ValueError) as exc:
+            raise SerializationError(
+                f"valor {value!r} incompatible con VECTOR({col.size}) "
+                f"(columna '{col.name}')") from exc
+    if len(vec) != col.size:
+        raise SerializationError(
+            f"vector de dimensión {len(vec)} en columna '{col.name}' "
+            f"VECTOR({col.size})")
+    return vec
+
+
 # ----------------------------------------------------------------------
 # Serialización de filas completas
 # ----------------------------------------------------------------------
@@ -96,6 +132,8 @@ def coerce_value(value, col: Column):
                     f"valor excede VARCHAR({col.size}) en columna '{col.name}'"
                 )
             return s
+        if col.type == TYPE_VECTOR:
+            return coerce_vector(value, col)
         if col.type == TYPE_TEXT:
             return str(value)
         if col.type == TYPE_POINT:
@@ -127,6 +165,8 @@ def serialize_row(columns: list[Column], values: list) -> bytes:
             out += struct.pack(f"<{col.size}s", v.encode("utf-8"))
         elif col.type == TYPE_POINT:
             out += struct.pack("<dd", v[0], v[1])
+        elif col.type == TYPE_VECTOR:
+            out += struct.pack(f"<{col.size}f", *v)
         elif col.type == TYPE_TEXT:
             data = v.encode("utf-8")
             out += struct.pack("<H", len(data)) + data
@@ -155,6 +195,9 @@ def deserialize_row(columns: list[Column], data: bytes) -> list:
             x, y = struct.unpack_from("<dd", data, pos)
             v = (x, y)
             pos += 16
+        elif col.type == TYPE_VECTOR:
+            v = struct.unpack_from(f"<{col.size}f", data, pos)
+            pos += 4 * col.size
         elif col.type == TYPE_TEXT:
             (n,) = struct.unpack_from("<H", data, pos)
             pos += 2

@@ -22,8 +22,8 @@ const VOYAGER_URL =
 // Tiles según el tema: CARTO Voyager (a color) en claro, CartoDB Dark
 // Matter en oscuro. Con key de CARTO van sin marca de agua; sin key, el
 // modo claro cae a OSM (gratis, sin watermark) y el oscuro queda con
-// watermark.
-const TILES = {
+// watermark. Se exporta para el mapa del Recomendador.
+export const TILES = {
   light: {
     url: CARTO_KEY
       ? VOYAGER_URL

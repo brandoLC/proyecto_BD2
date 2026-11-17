@@ -6,6 +6,10 @@
 - ``POST /api/infer-schema`` -> infiere el esquema de un CSV subido
 - ``POST /api/tables/{name}/upload-csv`` -> carga un CSV en una tabla
 - ``POST /api/tables/{name}/reorganize`` -> reorganiza una tabla SEQUENTIAL
+- ``POST /api/recommend/image`` -> recomendación por foto (embedding o BoVW)
+- ``POST /api/recommend/text``  -> recomendación por texto (TF-IDF coseno)
+- ``GET  /api/recommend/sample`` -> muestra aleatoria de productos
+- ``GET  /api/images/{product_id}.jpg`` -> thumbnail del producto
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import os
 import time
 
 from fastapi import APIRouter, File, Form, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from ..engine.csv_loader import (
@@ -33,6 +37,8 @@ from ..engine.csv_loader import (
 )
 from ..engine.executor import Engine
 from ..storage.record import Column, TYPE_POINT
+from ..ai import features as ai_features
+from ..ai import recommender
 
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 
@@ -234,3 +240,87 @@ async def upload_csv(name: str, file: UploadFile = File(...),
         "ignored_columns": ignored,
         "elapsed_ms": round((time.perf_counter() - start) * 1000, 3),
     }
+
+
+# ----------------------------------------------------------------------
+# Recomendador e-commerce (Entregable 2)
+# ----------------------------------------------------------------------
+class RecommendTextRequest(BaseModel):
+    text: str
+    k: int = 8
+    precio_min: float | None = None
+    precio_max: float | None = None
+    categoria: str | None = None
+    lat: float | None = None
+    lng: float | None = None
+    radio_km: float | None = None
+
+
+def _opt_float(value: str | None) -> float | None:
+    """Form field opcional a float ('' o None -> None)."""
+    if value is None or str(value).strip() == "":
+        return None
+    return float(value)
+
+
+@router.post("/recommend/image")
+async def recommend_image(
+        file: UploadFile = File(...),
+        mode: str = Form(default="embedding"),
+        k: int = Form(default=8),
+        precio_min: str | None = Form(default=None),
+        precio_max: str | None = Form(default=None),
+        categoria: str | None = Form(default=None),
+        lat: str | None = Form(default=None),
+        lng: str | None = Form(default=None),
+        radio_km: str | None = Form(default=None),
+        probes: int | None = Form(default=None)):
+    """Recomienda productos visualmente similares a la foto subida.
+
+    ``mode="embedding"`` usa el KNN coseno del índice IVF (paradigma
+    moderno); ``mode="bovw"`` usa las palabras visuales SIFT sobre el
+    índice invertido (paradigma clásico).
+    """
+    if mode not in ("embedding", "bovw"):
+        return {"ok": False, "error": "mode debe ser 'embedding' o 'bovw'",
+                "stage": "parse"}
+    image_bytes = await file.read()
+    try:
+        return recommender.recommend_by_image(
+            engine, image_bytes, mode=mode, k=k,
+            precio_min=_opt_float(precio_min),
+            precio_max=_opt_float(precio_max),
+            categoria=categoria,
+            lat=_opt_float(lat), lng=_opt_float(lng),
+            radio_km=_opt_float(radio_km), probes=probes)
+    except ValueError as exc:  # imagen no decodificable, filtros inválidos
+        return {"ok": False, "error": str(exc), "stage": "parse"}
+
+
+@router.post("/recommend/text")
+def recommend_text(req: RecommendTextRequest):
+    """Recomienda productos por descripción en lenguaje natural."""
+    return recommender.recommend_by_text(
+        engine, req.text, k=req.k,
+        precio_min=req.precio_min, precio_max=req.precio_max,
+        categoria=req.categoria,
+        lat=req.lat, lng=req.lng, radio_km=req.radio_km)
+
+
+@router.get("/recommend/sample")
+def recommend_sample(n: int = 12) -> dict:
+    """Muestra aleatoria de productos con la configuración del dataset."""
+    return recommender.sample_products(engine, n)
+
+
+@router.get("/images/{product_id}.jpg")
+def product_image(product_id: int):
+    """Thumbnail JPEG del producto generado en la preparación."""
+    path = os.path.join(ai_features.images_dir(), f"{product_id}.jpg")
+    if not os.path.isfile(path):
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False,
+                     "error": f"no hay imagen para el producto "
+                              f"{product_id}"})
+    return FileResponse(path, media_type="image/jpeg")

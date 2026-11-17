@@ -4,11 +4,14 @@ Proyecto del curso **CS2042 — Bases de Datos II** (UTEC).
 
 Motor de bases de datos construido **desde cero** en Python: almacenamiento en
 páginas de 4 KB (slotted pages, heap file con free list), índices B+ Tree,
-Hash Extensible y R-Tree, parser SQL propio y ejecutor con plan de consulta.
-Se expone vía API REST (FastAPI) y se consume desde un cliente SQL web
-(React + Vite + Tailwind v4 + Leaflet).
+Hash Extensible, R-Tree, índice invertido en disco (búsqueda booleana y
+ranking TF-IDF coseno) e índice ANN IVF sobre embeddings, parser SQL propio
+y ejecutor con plan de consulta. Se expone vía API REST (FastAPI) y se
+consume desde un cliente web (React + Vite + Tailwind v4 + Leaflet) con dos
+vistas: workbench SQL y recomendador e-commerce multimodal.
 
-Estado actual: **Partes 1 y 2** (relacional + espacial) — entrega parcial, semana 8.
+Estado actual: **Entregable 2** (relacional + espacial + textual +
+vectorial + aplicación de IA) — semana 15.
 
 ## Levantar todo con Docker Compose
 
@@ -30,7 +33,10 @@ docker compose down -v     # detener y borrar los datos
 
 ```
 backend/    Motor de BD (storage, índices, parser, ejecutor) + API FastAPI
-frontend/   Cliente SQL web (editor, resultados, plan de ejecución, mapa)
+            + app de IA (app/ai, scripts/prepare_recommender.py)
+frontend/   Cliente web (editor SQL, resultados, plan, mapa, recomendador)
+benchmarks/ Experimentos 1-8 (resultados CSV en benchmarks/results/)
+informe/    Informe técnico LaTeX
 ```
 
 Ver `backend/README.md` para la gramática SQL soportada y la arquitectura
@@ -45,6 +51,25 @@ INSERT INTO tiendas VALUES (1, 'Tienda Norte', (-12.04, -77.04));
 SELECT * FROM tiendas WHERE location KNN ((-12.04, -77.04), 3);
 SELECT id, nombre FROM tiendas WHERE location IN ((-12.04, -77.04), 0.02);
 ```
+
+## Recomendador e-commerce (Entregable 2)
+
+La pestaña **Recomendador** del cliente web busca productos por foto
+(embeddings ResNet-18 sobre el índice IVF, o palabras visuales SIFT/BoVW
+sobre el índice invertido) o por texto (ranking TF-IDF), con filtros de
+precio (B+ Tree), categoría y cercanía de tienda (R-Tree). Requiere
+preparar el dataset (una sola vez, con el venv local del backend):
+
+```bash
+cd backend
+pip install -r requirements.txt -r requirements-app.txt
+.venv/bin/python scripts/prepare_recommender.py \
+  --source fashion --data-dir /ruta/a/fashion-dataset --limit 10000 --reset
+```
+
+(`--source natural` con las Natural Images del Lab 11 sirve para una
+validación rápida de 600 productos.) Las dependencias de IA no se instalan
+en la imagen Docker: la app IA se corre en local con el venv.
 
 ## Carga de datos desde CSV
 

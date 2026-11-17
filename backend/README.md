@@ -10,6 +10,15 @@ clases del curso:
   y **Hash Extensible**.
 - **Parte 2**: índice espacial **R-Tree** (split cuadrático, búsqueda por
   radio con poda por MBR y KNN con cola de prioridad).
+- **Parte 3**: módulo textual — **índice invertido en disco** con
+  consultas booleanas y ranking TF-IDF por similitud de coseno.
+- **Parte 4**: módulo vectorial — tipo **VECTOR(n)**, índice ANN **IVF**
+  en disco (K-Means + listas invertidas paginadas) y planificador
+  híbrido (pre-filtering / post-filtering).
+- **Aplicación de IA**: recomendador e-commerce multimodal
+  (`app/ai/` + `scripts/prepare_recommender.py`) que ejercita los cuatro
+  índices a la vez (B+ precio, R-Tree tienda, invertido descripción y
+  BoVW, IVF embeddings).
 
 ## Arquitectura
 
@@ -17,8 +26,11 @@ clases del curso:
 SQL → parser (tokenizer + recursivo descendente, AST)
     → executor (validación semántica, plan de ejecución con tiempos)
     → storage (páginas ranuradas 4 KB, heap file, serialización struct)
-      / indexes (B+ Tree, Hash Extensible, R-Tree, cada uno en su archivo)
-    → disco (directorio DATA_DIR: <tabla>.heap, <tabla>_<col>.btree|hash|rtree)
+      / indexes (B+ Tree, Hash Extensible, R-Tree, Invertido, IVF)
+      / text (preprocesamiento: stopwords + stemming Snowball)
+    → disco (directorio DATA_DIR: <tabla>.heap,
+      <tabla>_<col>.btree|hash|rtree, <tabla>_<col>.dic|.inv|.docs|.nrm,
+      <tabla>_<col>.cen|.lst)
 ```
 
 - `app/storage/page.py` — `SlottedPage` de 4096 bytes: cabecera
@@ -30,8 +42,8 @@ SQL → parser (tokenizer + recursivo descendente, AST)
   permanece estable) y `compact()` elimina la fragmentación.
 - `app/storage/record.py` — serialización con `struct`:
   `INT='i'`, `FLOAT='d'`, `BOOL='?'`, `VARCHAR(n)='{n}s'`, `POINT='dd'`,
-  `TEXT` con prefijo de longitud. Registro de longitud fija si no hay
-  columnas `TEXT`.
+  `VECTOR(n)='{n}f'` (float32), `TEXT` con prefijo de longitud. Registro
+  de longitud fija si no hay columnas `TEXT`.
 - `app/storage/heap_file.py` — archivo de páginas de 4 KB. La página 0
   guarda metadatos y la cabeza de la lista de libres. RID =
   `(page_id, slot_id)`. Insertar reutiliza primero slots libres; borrar
@@ -48,6 +60,27 @@ SQL → parser (tokenizer + recursivo descendente, AST)
   `search_radius` (poda por MBR + filtro de distancia exacta) y `knn`
   (min-heap sobre la distancia mínima al MBR). Eliminación sin
   reinserción en underflow (simplificación didáctica).
+- `app/text/preprocess.py` — pipeline léxico del índice invertido:
+  minúsculas, eliminación de acentos (conservando `ñ`), stopwords ES/EN
+  (`stoplist_*.txt`) y stemming Snowball (nltk). El idioma `none`
+  desactiva stopwords y stemming (vocabularios controlados, p. ej. las
+  palabras visuales `vw{id}` del BoVW).
+- `app/text/query_parser.py` — parser de la consulta MATCH: AND/OR/NOT,
+  paréntesis y AND implícito entre términos yuxtapuestos.
+- `app/indexes/inverted_index.py` — índice invertido en disco, cuatro
+  archivos: `<base>.dic` (vocabulario con offset/longitud/df de cada
+  término), `<base>.inv` (listas de posteo `(doc_id, tf)` leídas por
+  seek), `<base>.docs` (mapa RID → doc_id + lápida) y `<base>.nrm`
+  (normas L2 TF-IDF de cada documento). Delta en memoria con flush que
+  fusiona posteos y recalcula normas. Soporta `search_boolean` (merge
+  de dos punteros AND/OR/AND-NOT) y `cosine_topk` (heap Top-K).
+- `app/indexes/ivf.py` — índice ANN **IVF** en disco: `<base>.cen`
+  (directorio de centroides + código de métrica) y `<base>.lst`
+  (listas invertidas paginadas en páginas de 4 KB encadenadas por
+  celda, entradas `<rid_page, rid_slot, alive, vector[D]>`). K-Means
+  propio con numpy (k-means++, 25 iteraciones); búsqueda con `probes`
+  celdas más cercanas y max-heap del Top-K; métricas L2 y coseno.
+  Inserciones y borrados (lápida) en línea tras el build.
 - `app/engine/catalog.py` — catálogo del sistema en `catalog.json`
   (esquemas de tablas e índices), persistido en cada DDL.
 - `app/engine/parser.py` — tokenizer + parser recursivo descendente;
@@ -64,7 +97,8 @@ SQL → parser (tokenizer + recursivo descendente, AST)
 
 ```sql
 CREATE TABLE nombre (col TIPO [PRIMARY KEY], ...);
--- TIPO: INT | FLOAT | VARCHAR(n) | TEXT | BOOL | POINT  (POINT = dos floats x,y)
+-- TIPO: INT | FLOAT | VARCHAR(n) | TEXT | BOOL | POINT | VECTOR(n)
+-- POINT = dos floats (x, y); VECTOR(n) = n floats (embeddings)
 -- Si no se declara PRIMARY KEY, el motor agrega una implícita SERIAL
 -- autoincremental: `id INT PRIMARY KEY (auto)` (o `_minidb_id` si `id`
 -- ya existe). Va primera en el esquema; un INSERT que no la menciona
@@ -74,10 +108,32 @@ CREATE TABLE nombre (col TIPO [PRIMARY KEY], ...);
 CREATE INDEX [nombre] ON tabla (col) USING BTREE|HASH|RTREE;
 -- RTREE solo sobre columnas POINT; BTREE/HASH sobre columnas escalares
 
-INSERT INTO t VALUES (v1, v2, ...);          -- un literal POINT se escribe (x, y)
+CREATE INDEX [nombre] ON tabla (col) USING INVERTED
+  [WITH (scoring = 'TFIDF_COSINE',
+         language = 'spanish'|'english'|'none')];
+-- INVERTED solo sobre columnas TEXT o VARCHAR: índice invertido en disco
+-- (diccionario .dic + listas de posteo .inv + mapa de docs .docs +
+-- normas L2 .nrm). Preprocesamiento: minúsculas, sin acentos, stopwords
+-- ES/EN y stemming Snowball (nltk); 'none' no aplica ninguno (tokens tal
+-- cual, p. ej. palabras visuales de BoVW).
+
+CREATE INDEX [nombre] ON tabla (col) USING IVF
+  [WITH (metric = 'L2'|'COSINE', lists = k)];
+-- IVF solo sobre columnas VECTOR(n): K-Means (k-means++) sobre los
+-- vectores existentes, centroides en .cen y listas invertidas paginadas
+-- en .lst. lists por defecto floor(sqrt(N)). La tabla no puede estar
+-- vacía (el K-Means necesita los vectores).
+
+SET ivf.probes = n;
+-- parámetro de sesión: cuántas celdas del IVF explora cada consulta ANN
+-- (por defecto 1; más probes = más recall a más I/O y latencia)
+
+INSERT INTO t VALUES (v1, v2, ...);
+-- un literal POINT se escribe (x, y) y un VECTOR '[f1, f2, ...]'
 
 SELECT * | c1, c2 | COUNT(*), MIN(c), MAX(c), SUM(c), AVG(c) FROM t
-  [WHERE cond [AND cond ...]] [LIMIT n [OFFSET m]];
+  [WHERE cond [AND cond ...]]
+  [ORDER BY col ASC|DESC] [LIMIT n [OFFSET m]];
 -- los agregados se combinan entre sí (un solo grupo, sin GROUP BY) y no
 --   con columnas sueltas; siempre devuelven 1 fila (COUNT=0, MIN/MAX/SUM/AVG=NULL sin filas)
 -- cond:
@@ -85,8 +141,42 @@ SELECT * | c1, c2 | COUNT(*), MIN(c), MAX(c), SUM(c), AVG(c) FROM t
 --   col BETWEEN a AND b
 --   pointcol IN ((x, y), r)     -- radio espacial (R-Tree + distancia exacta)
 --   pointcol KNN ((x, y), k)    -- k vecinos más cercanos (R-Tree + min-heap)
+--   textcol MATCH 'consulta'    -- búsqueda textual (índice invertido)
 -- con AND el planificador usa el índice de la mejor condición y aplica
 --   el resto como filtro residual (paso "Residual Filter" en el plan)
+-- ORDER BY solo en consultas con ranking (COSINE_SCORE, KNN o distancia
+-- vectorial)
+
+-- Búsqueda textual booleana (AND, OR, NOT, paréntesis; AND implícito
+-- entre términos yuxtapos). Sin índice cae a Full Text Scan por fila:
+SELECT id, titulo FROM docs
+WHERE cuerpo MATCH 'aprendizaje AND profundo AND NOT basico';
+
+-- Ranking TF-IDF con similitud de coseno (bolsa de términos: no admite
+-- OR/NOT). Top-K con heap; ORDER BY sobre el alias del score:
+SELECT id, titulo, COSINE_SCORE() AS relevancia FROM docs
+WHERE cuerpo MATCH 'aprendizaje profundo'
+ORDER BY relevancia DESC LIMIT 10;
+
+-- Alias en columnas del SELECT:
+SELECT nombre AS n, precio FROM productos LIMIT 5;
+
+-- Búsqueda por similitud de embeddings: la distancia es un item del
+-- SELECT ('<=>' coseno, '<->' euclídea L2) con alias opcional. El
+-- operador debe coincidir con la métrica del índice IVF:
+SELECT id, nombre, embedding <=> '[0.12, -0.03, ...]' AS dist
+FROM productos LIMIT 10;
+
+-- Planificador híbrido (paso "Vector Strategy" del plan):
+--   WHERE con índice relacional -> Pre-filtering (índice acota los RIDs
+--     y la distancia exacta se calcula solo sobre ellos)
+--   WHERE sin índice + IVF      -> Post-filtering (ANN primero, filtro
+--     del WHERE sobre los candidatos)
+--   sin WHERE + IVF             -> ANN puro (Top-K del IVF, probes de
+--     la sesión)
+--   sin índice IVF              -> Exact Vector Scan (k-NN lineal)
+SELECT id, nombre, embedding <=> '[...]' AS dist
+FROM productos WHERE precio BETWEEN 50 AND 150 LIMIT 10;
 
 DELETE FROM t WHERE col = lit;
 
@@ -296,6 +386,45 @@ python -m pytest tests/ -q
   "stage": "parse|semantic|execution"}`; cuando la tabla (o el índice)
   ya existe, además del cuerpo de error habitual se responde con
   **HTTP 409** (el frontend ya maneja este caso devolviendo el cuerpo).
+- `POST /api/recommend/image` (multipart: `file` + filtros `mode`,
+  `k`, `precio_min`, `precio_max`, `categoria`, `lat`, `lng`,
+  `radio_km`, `probes`) → recomendación por foto: `mode="embedding"`
+  (KNN coseno sobre el IVF) o `mode="bovw"` (palabras visuales SIFT
+  sobre el índice invertido). Devuelve `{"ok", "products", "sql",
+  "plan", "io", "elapsed_ms"}`.
+- `POST /api/recommend/text` con `{"text", "k", filtros...}` → Top-K
+  TF-IDF coseno sobre la descripción (índice invertido).
+- `GET /api/recommend/sample?n=12` → muestra aleatoria del catálogo +
+  configuración del dataset (`app_config.json`).
+- `GET /api/images/{id}.jpg` → thumbnail del producto.
+
+## Recomendador e-commerce (aplicación de IA)
+
+La app del Entregable 2 vive en `app/ai/` (`features.py`: SIFT + BoVW y
+ResNet-18; `recommender.py`: traducción de la petición a SQL del motor)
+y se prepara con `scripts/prepare_recommender.py`:
+
+```bash
+cd backend
+pip install -r requirements-app.txt   # torch CPU, opencv, sklearn
+# Natural Images (validación, 600 imágenes del Lab 11):
+.venv/bin/python scripts/prepare_recommender.py \
+  --source natural --data-dir /ruta/a/natural_images --reset
+# Fashion Product Images de Kaggle (entrega, >= 10k productos):
+.venv/bin/python scripts/prepare_recommender.py \
+  --source fashion --data-dir /ruta/a/fashion-dataset --limit 10000 --reset
+```
+
+El script extrae por imagen el histograma BoVW (SIFT → K-Means K=100,
+codebook en `data/codebook.npy`) y el embedding ResNet-18 (512D,
+L2-normalizado), genera metadatos sintéticos (precio, tienda con
+coordenadas en Lima), crea la tabla `productos` y los cinco índices:
+B+ Tree (`precio`), R-Tree (`tienda`), dos índices invertidos
+(`descripcion` en español, `bovw` con `language='none'`) e IVF
+(`embedding`, coseno). Los thumbnails quedan en `data/app_images/`.
+
+Las dependencias de IA (`requirements-app.txt`) van aparte: el motor y
+su imagen Docker no las necesitan.
 
 ## Sesión de ejemplo
 

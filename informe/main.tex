@@ -33,7 +33,7 @@
   linkcolor=utecblue,
   urlcolor=petroleo,
   citecolor=utecblue,
-  pdftitle={MiniDB: Gestor de Bases de Datos Multimodal -- Entregable 1},
+  pdftitle={MiniDB: Gestor de Bases de Datos Multimodal -- Entregable 2},
   pdfauthor={Brando López Carrera, Fabricio Godofredo Ladera La Torre, Edson Gustavo Guardamino Felipe, Juaquin Ernesto Huaman Garcia},
 }
 
@@ -53,7 +53,7 @@
 \pagestyle{fancy}
 \fancyhf{}
 \fancyhead[L]{\small\itshape\color{grafito} Base de Datos II (CS2042)}
-\fancyhead[R]{\small\itshape\color{grafito} MiniDB --- Entregable 1}
+\fancyhead[R]{\small\itshape\color{grafito} MiniDB --- Entregable 2}
 \fancyfoot[C]{\small\color{grafito}\thepage}
 \renewcommand{\headrulewidth}{0.5pt}
 \renewcommand{\headrule}{\color{utecblue!55}\hrule width\headwidth height\headrulewidth}
@@ -121,7 +121,7 @@
 \vspace{1.4cm}
 {\color{utecblue}\Huge\bfseries MiniDB}\\[0.45cm]
 {\LARGE Gestor de Bases de Datos Multimodal}\\[1.1cm]
-{\color{petroleo}\Large\bfseries Entregable 1}
+{\color{petroleo}\Large\bfseries Entregable 2 --- Extensión Multimodal}
 
 \vfill
 \begin{tabular}{rl}
@@ -170,6 +170,27 @@ Los objetivos específicos del Entregable 1 son:
         las complejidades teóricas: $O(P)$ del escaneo secuencial,
         $O(\log N)$ del B+ Tree, $O(1)$ del hash, búsqueda binaria del
         archivo secuencial.
+\end{itemize}
+
+El presente Entregable 2 extiende el motor a un gestor
+\textbf{multimodal} y despliega sobre él una aplicación de IA:
+
+\begin{itemize}
+  \item Módulo textual: índice invertido persistido en disco
+        (diccionario + listas de posteo + normas), consultas booleanas
+        (AND, OR, NOT) y ranking Top-K con TF-IDF y similitud de coseno.
+  \item Módulo vectorial: tipo \texttt{VECTOR(n)}, índice ANN \textbf{IVF}
+        en disco (K-Means + listas invertidas paginadas) y planificador
+        híbrido (pre-filtering y post-filtering) que combina el filtro
+        relacional con la búsqueda aproximada de vecinos.
+  \item Aplicación de IA: recomendador e-commerce que compara el paradigma
+        clásico (SIFT + K-Means + BoVW + índice invertido) con el moderno
+        (embeddings densos ResNet-18 + IVF), usando simultáneamente los
+        cuatro índices del motor (B+ Tree, R-Tree, invertido, IVF).
+  \item Experimentación de la Parte 2: escalabilidad espacial y maldición
+        de la dimensionalidad (Exp.~5), índice invertido vs.\ Full Scan y
+        GIN de PostgreSQL (Exp.~6), BoVW vs.\ embeddings (Exp.~7) y curva
+        Recall@10 vs.\ \texttt{probes} en la búsqueda ANN (Exp.~8).
 \end{itemize}
 
 \section{Diseño físico de almacenamiento}
@@ -348,6 +369,76 @@ poda por MBR y KNN con cola de prioridad por \emph{mindist}. Sirve como
 condicional (condiciones \texttt{IN (punto, radio)} y
 \texttt{KNN (punto, k)}).
 
+\subsection{Índice invertido en disco (módulo textual)}
+
+El módulo textual persiste el índice invertido en cuatro archivos por
+columna indexada, siguiendo el diseño clásico del curso:
+
+\begin{itemize}
+  \item \texttt{<tabla>\_<col>.dic}: vocabulario ordenado. Cada entrada
+        guarda el término, su \emph{document frequency} y el
+        \emph{offset}/longitud de su lista de posteo dentro de
+        \texttt{.inv}. El diccionario se carga completo a memoria al abrir
+        el índice (el vocabulario es pequeño frente a los posteos) y se
+        localiza por búsqueda binaria.
+  \item \texttt{<tabla>\_<col>.inv}: listas de posteo \texttt{(doc\_id,
+        tf)} contiguas por término, leídas por \texttt{seek} (solo se
+        traen de disco las listas de los términos de la consulta; cada
+        lectura queda contabilizada por el DiskCounter).
+  \item \texttt{<tabla>\_<col>.docs}: mapa \texttt{doc\_id} $\to$ RID del
+        heap + lápida de borrado (los \texttt{DELETE} marcan el documento
+        sin reescribir listas; los documentos muertos se filtran al
+        recuperar).
+  \item \texttt{<tabla>\_<col>.nrm}: norma L2 del vector TF-IDF de cada
+        documento, precomputada para que la similitud de coseno del Top-K
+        sea una acumulación de productos punto sobre las listas de los
+        términos de la consulta.
+\end{itemize}
+
+Las inserciones van primero a un \emph{delta} en memoria; al superar un
+umbral (o al cerrar el índice) un \emph{flush} fusiona los posteos del
+delta con los de disco y recalcula las normas afectadas, el esquema
+estándar de mantenimiento de índices invertidos en motores de búsqueda.
+
+El preprocesamiento léxico (\texttt{app/text/}) aplica minúsculas,
+eliminación de acentos conservando la \texttt{ñ}, stopwords en español e
+inglés y stemming Snowball (nltk); un idioma adicional \texttt{none}
+desactiva stopwords y stemming para indexar \emph{vocabularios
+controlados} --- en la aplicación de IA, las palabras visuales
+\texttt{vw\{id\}} del modelo BoVW. La consulta \texttt{MATCH} admite
+sintaxis booleana completa (AND, OR, NOT, paréntesis, AND implícito) con
+\emph{merge} de dos punteros sobre las listas ordenadas, y la variante de
+ranking (\texttt{COSINE\_SCORE()}) resuelve el Top-K con un heap sobre la
+similitud de coseno TF-IDF.
+
+\subsection{Índice IVF (búsqueda ANN sobre embeddings)}
+
+Para el módulo vectorial se implementó el tipo \texttt{VECTOR(n)}
+(serializado como \texttt{\{n\}f}, float32) y el índice \textbf{IVF}
+(\emph{Inverted File Index}) en disco, en dos archivos:
+
+\begin{itemize}
+  \item \texttt{<tabla>\_<col>.cen}: directorio de centroides. La cabecera
+        guarda la dimensión $D$, el número de celdas $K$ y el \emph{código
+        de métrica} (L2 o coseno) con la que se entrenó el índice; el
+        ejecutor la exige al operador SQL correspondiente
+        (\texttt{\textless-\textgreater}/\texttt{\textless=\textgreater}).
+  \item \texttt{<tabla>\_<col>.lst}: listas invertidas paginadas. Cada
+        celda del K-Means posee una cadena de páginas de 4 KB con entradas
+        \texttt{<rid\_page, rid\_slot, alive, vector[D]}; los borrados son
+        lápidas y las inserciones posteriores al build se anexan a la
+        celda de su centroide más cercano.
+\end{itemize}
+
+La construcción (\texttt{CREATE INDEX ... USING IVF}) entrena un K-Means
+propio con numpy (inicialización k-means++, 25 iteraciones) sobre todos
+los vectores de la tabla y vuelca cada vector a su lista. La consulta ANN
+(\texttt{search}) elige las \texttt{probes} celdas cuyos centroides son
+más cercanos a la consulta, recorre sus páginas y mantiene el Top-K en un
+max-heap: el costo de I/O es proporcional a
+\texttt{probes}/$K$ del archivo de listas, no a la tabla completa
+(Experimento 8).
+
 \section{Motor SQL y planificador}
 
 \subsection{Subconjunto SQL}
@@ -358,14 +449,22 @@ Parser recursivo descendente propio (keywords case-insensitive):
   \item \texttt{CREATE TABLE} (con PK de una columna y
         \texttt{USING HEAP|SEQUENTIAL}), \texttt{CREATE TABLE ... FROM FILE},
         \texttt{LOAD INTO ... FROM FILE}, \texttt{DROP TABLE}.
-  \item \texttt{CREATE INDEX [nombre] ON t (col) USING BTREE|HASH|RTREE}.
+  \item \texttt{CREATE INDEX [nombre] ON t (col) USING
+        BTREE|HASH|RTREE|INVERTED|IVF} con parámetros \texttt{WITH}
+        (\texttt{language}, \texttt{scoring}; \texttt{metric},
+        \texttt{lists}).
   \item \texttt{INSERT INTO ... VALUES}, \texttt{DELETE FROM ... WHERE col = v}.
+  \item \texttt{SET ivf.probes = n} (parámetro de sesión de la búsqueda ANN).
   \item \texttt{SELECT} con \texttt{WHERE} (=, $<$, $\le$, $>$, $\ge$,
-        \texttt{BETWEEN}, condiciones espaciales) con conjunciones
+        \texttt{BETWEEN}, condiciones espaciales, \texttt{MATCH} textual)
+        con conjunciones
         \texttt{AND} (el planificador elige el mejor índice de la
         conjunción y aplica el resto como filtro residual),
-        \texttt{LIMIT/OFFSET} y
-        agregados \texttt{COUNT/MIN/MAX/SUM/AVG}.
+        \texttt{ORDER BY} en consultas con ranking,
+        \texttt{LIMIT/OFFSET}, alias \texttt{AS}, distancia vectorial como
+        item del \texttt{SELECT} (\texttt{emb \textless=\textgreater\ '[...]'}
+        coseno, \texttt{\textless-\textgreater} L2), \texttt{COSINE\_SCORE()}
+        y agregados \texttt{COUNT/MIN/MAX/SUM/AVG}.
 \end{itemize}
 
 \subsection{Selección de la vía de acceso}
@@ -378,7 +477,31 @@ El ejecutor construye un plan con tiempos por paso y elige:
   \item \textbf{Binary Search (Sequential)} para predicados sobre la PK de
         una tabla \texttt{USING SEQUENTIAL} (el propio archivo ordenado es
         la vía de acceso; no se genera B+ Tree redundante).
+  \item \textbf{Inverted Index Boolean Scan} / \textbf{Inverted Index TopK
+        Scan} para condiciones \texttt{MATCH} sobre columnas con índice
+        invertido (merge booleano o ranking coseno TF-IDF); sin índice,
+        \textbf{Full Text Scan} como línea base.
   \item \textbf{Sequential Scan} cuando no hay índice usable.
+\end{itemize}
+
+\subsection{Planificador híbrido de consultas vectoriales}
+
+Una consulta con distancia vectorial en el \texttt{SELECT} activa un
+planificador propio, que reporta su decisión en el paso \emph{Vector
+Strategy} del plan:
+
+\begin{itemize}
+  \item \textbf{Pre-filtering}: si el \texttt{WHERE} tiene vía de acceso
+        por índice relacional (B+, Hash o R-Tree), se recuperan esos RIDs
+        y la distancia exacta se calcula solo sobre ellos. Es la estrategia
+        correcta cuando el filtro es muy selectivo.
+  \item \textbf{Post-filtering}: si no hay índice relacional pero sí IVF,
+        el ANN devuelve candidatos y el \texttt{WHERE} se evalúa después,
+        sobre los candidatos.
+  \item \textbf{ANN puro}: sin \texttt{WHERE}, Top-K directo del IVF con
+        los \texttt{probes} de la sesión.
+  \item \textbf{Exact Vector Scan}: sin índice IVF, k-NN lineal por fuerza
+        bruta; es la verdad base (\emph{ground truth}) del Experimento 8.
 \end{itemize}
 
 \subsection{DiskCounter: medición honesta de I/O}
@@ -401,16 +524,78 @@ números reportados son comparables con el modelo de costos del curso.
 \begin{itemize}
   \item \textbf{Motor} (Python puro): \texttt{storage/} (página, heap,
         sequential file, serialización, disk counter), \texttt{indexes/}
-        (B+ Tree, Hash Extensible, R-Tree), \texttt{engine/} (parser,
-        catálogo JSON, ejecutor, cargador CSV).
+        (B+ Tree, Hash Extensible, R-Tree, índice invertido, IVF),
+        \texttt{text/} (preprocesamiento léxico, parser de consultas
+        booleanas), \texttt{engine/} (parser, catálogo JSON, ejecutor,
+        cargador CSV).
   \item \textbf{API REST} (FastAPI): \texttt{/api/query},
         \texttt{/api/tables}, \texttt{/api/tables/\{t\}/reorganize}, carga e
-        inferencia de CSV.
+        inferencia de CSV, y los endpoints del recomendador
+        (\texttt{/api/recommend/*}, \texttt{/api/images/\{id\}.jpg}).
+  \item \textbf{Aplicación de IA} (\texttt{app/ai/}): extracción de
+        características (SIFT + codebook BoVW; ResNet-18 512D) y traducción
+        de la petición del usuario a sentencias SQL del propio motor.
   \item \textbf{Frontend} (React + Vite + Leaflet): consola SQL con plan e
-        I/O por consulta, explorador de tablas y mapa espacial.
+        I/O por consulta, explorador de tablas, mapa espacial y la vista
+        del recomendador e-commerce.
   \item \textbf{Despliegue}: \texttt{docker compose} (backend + frontend con
-        nginx), volumen persistente para los datos.
+        nginx), volumen persistente para los datos. Las dependencias de IA
+        (torch, OpenCV, scikit-learn) van en un
+        \texttt{requirements-app.txt} separado para mantener ligera la
+        imagen del motor; la app IA se ejecuta local con el entorno
+        virtual del backend.
 \end{itemize}
+
+\section{Aplicación de IA: recomendador e-commerce}
+
+Sobre el motor multimodal se desplegó un recomendador de productos que
+ejercita \emph{simultáneamente} los cuatro índices. La tabla
+\texttt{productos} se prepara con
+\texttt{backend/scripts/prepare\_recommender.py} (dataset \emph{Fashion
+Product Images} de Kaggle; para la validación se usaron las 600 Natural
+Images del Laboratorio 11):
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{Columna} & \textbf{Tipo} & \textbf{Índice} & \textbf{Uso en la app} \\
+\midrule
+\texttt{precio}      & \texttt{FLOAT}      & B+ Tree   & filtro por rango de precio \\
+\texttt{tienda}      & \texttt{POINT}      & R-Tree    & radio de cercanía de la tienda \\
+\texttt{descripcion} & \texttt{TEXT}       & Invertido & búsqueda por texto (español) \\
+\texttt{bovw}        & \texttt{TEXT}       & Invertido & palabras visuales (\texttt{language=none}) \\
+\texttt{embedding}   & \texttt{VECTOR(512)} & IVF      & similitud visual (coseno) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Cada imagen se representa de dos formas, replicando el pipeline del
+Laboratorio 11: (i) \textbf{BoVW} --- descriptores SIFT (150 keypoints)
+cuantizados contra un codebook de 100 palabras visuales entrenado con
+MiniBatchKMeans, guardados como tokens \texttt{vw\{id\}} repetidos por
+frecuencia, de modo que el propio índice invertido textual deriva el TF y
+rankea con TF-IDF; y (ii) \textbf{embedding denso} --- vector de 512
+dimensiones de una ResNet-18 preentrenada en ImageNet con la capa
+\texttt{fc} reemplazada por \texttt{Identity}, normalizado L2, consultado
+con distancia coseno sobre el índice IVF.
+
+El usuario sube una foto (o escribe una descripción) y aplica filtros
+comerciales; el recomendador traduce la petición a SQL del motor, p.~ej.:
+
+\begin{cajaformato}
+SELECT ..., embedding \textless=\textgreater\ '[...]' AS dist FROM productos\\
+WHERE precio >= 50 AND precio <= 150\\
+\hspace*{1em}AND tienda IN ((-12.1192, -77.0297), 0.027)\\
+LIMIT 8;
+\end{cajaformato}
+
+que el planificador resuelve con \emph{pre-filtering} (B+ Tree y R-Tree
+acotan los candidatos y la distancia coseno exacta se calcula solo sobre
+ellos). La interfaz muestra los productos con su imagen, el SQL generado,
+el plan de ejecución paso a paso y las métricas de I/O, lo que permite
+demostrar en vivo el Experimento 7 (conmutador BoVW clásico vs.\
+embeddings) y el 8 (parámetro \texttt{probes} editable).
 
 \section{Experimentación}
 
@@ -684,6 +869,418 @@ búsquedas puntuales. La elección de $B$ es entonces un compromiso entre
 altura del índice y granularidad de transferencia; 4 KB coincide con la
 página del sistema operativo y equilibra ambos extremos.
 
+\section{Experimentación del Entregable 2}
+
+La metodología es la misma de la sección anterior (scripts en
+\texttt{benchmarks/}, DiskCounter, semillas fijas, promedio $\pm$ std).
+Los experimentos 7 y 8 se ejecutan sobre la tabla \texttt{productos} de la
+aplicación de IA (600 productos de Natural Images, 6 categorías).
+
+\subsection{Experimento 5: escalabilidad espacial y maldición de la
+dimensionalidad}
+
+\paragraph{Parte A: R-Tree vs.\ escaneo secuencial.}
+$N \in [10^4, 5\cdot10^4, 10^5]$ puntos 2D uniformes en el área de Lima;
+consultas de radio ($r = 0.005^\circ \approx 0.55$ km y $r = 0.05^\circ
+\approx 5.5$ km) y k-NN con $k \in [5, 20, 50]$ (30 consultas por celda).
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 5A: lecturas de bloques promedio por consulta
+(full scan vs.\ R-Tree).}
+\label{tab:exp5a}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{Consulta} & \textbf{Variante} &
+$N{=}10^4$ & $N{=}5\cdot10^4$ & $N{=}10^5$ \\
+\midrule
+radio $0.005^\circ$ & scan  & 160   & 795    & 1589   \\
+radio $0.005^\circ$ & R-Tree & \textbf{15.3}  & \textbf{43.1}   & \textbf{70.4}   \\
+radio $0.05^\circ$  & scan  & 160   & 795    & 1589   \\
+radio $0.05^\circ$  & R-Tree & 159.4 & 747.7  & 1476.4 \\
+KNN $k{=}5$         & R-Tree & 17.3  & 31.0   & 41.0   \\
+KNN $k{=}20$        & R-Tree & 31.6  & 48.7   & 59.7   \\
+KNN $k{=}50$        & R-Tree & 59.1  & 81.4   & 94.2   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 5A: latencia promedio por consulta (ms).}
+\label{tab:exp5b}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{Consulta} & \textbf{Variante} &
+$N{=}10^4$ & $N{=}5\cdot10^4$ & $N{=}10^5$ \\
+\midrule
+radio $0.005^\circ$ & scan   & 20.2 & 98.9  & 201.1 \\
+radio $0.005^\circ$ & R-Tree & 0.47 & 1.25  & 2.38  \\
+radio $0.05^\circ$  & scan   & 19.5 & 134.1 & 215.8 \\
+radio $0.05^\circ$  & R-Tree & 4.00 & 32.7  & 85.2  \\
+KNN $k{=}5$         & scan   & 26.8 & 256.4 & 577.1 \\
+KNN $k{=}5$         & R-Tree & 0.51 & 2.11  & 4.46  \\
+KNN $k{=}50$        & scan   & 40.9 & 251.6 & 577.5 \\
+KNN $k{=}50$        & R-Tree & 1.25 & 2.49  & 4.62  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Análisis.}
+El full scan lee siempre las $P$ páginas del heap (160/795/1589, std $=0$:
+no depende de la consulta). Con radio \emph{pequeño} el R-Tree descarta
+casi todo el espacio vía poda por MBR: lee $\sim$23$\times$ menos bloques
+a $N{=}10^5$ (70 vs.\ 1589) con latencias $\sim$100$\times$ menores.
+Con radio \emph{grande} ($0.05^\circ$ cubre $\sim$10\,\% del área de
+Lima) la poda deja de ser selectiva: los MBR de los nodos internos
+intersectan la región de consulta casi todos, y el R-Tree lee casi tantas
+páginas como el scan (1476 vs.\ 1589) --- es la misma maldición de la
+dimensionalidad en miniatura: a regiones de consulta grandes la geometría
+deja de discriminar. El KNN, en cambio, escala suavemente con $k$ (de
+41 a 94 lecturas entre $k{=}5$ y $k{=}50$ a $N{=}10^5$) gracias a la cola
+de prioridad por \emph{mindist}, que visita primero los nodos más
+prometedores y poda el resto.
+
+\paragraph{Parte B: maldición de la dimensionalidad.}
+El R-Tree del motor es 2D; el efecto de la dimensión se evalúa con un
+R-Tree $N$-dimensional empaquetado (STR, hojas de 50 puntos, mejor caso
+posible de organización) sobre $N = 20\,000$ puntos uniformes en
+$[0,1]^D$. La métrica es la fracción de hojas (páginas de datos) cuyo MBR
+queda a \emph{mindist} $\le$ distancia al 10.º vecino: las que
+\emph{cualquier} k-NN con poda por MBR está obligado a leer.
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 5B: fracción de hojas visitadas por un k-NN
+($k{=}10$, $N{=}20\,000$) según la dimensión.}
+\label{tab:exp5dim}
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{Dimensión $D$} & 2 & 4 & 8 & 16 & 32 & 64 & 128 \\
+\midrule
+Hojas visitadas (de 400) & 10.4 & 81.3 & 249.7 & 392.2 & 400 & 400 & 400 \\
+Fracción (\%)            & 2.6  & 20.3 & 62.4  & 98.0  & 100  & 100  & 100 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    estilodoc,
+    width=0.8\textwidth, height=6cm,
+    xlabel={Dimensión $D$}, ylabel={Hojas visitadas (\%)},
+    xmode=log, log basis x=2,
+    xtick={2,4,8,16,32,64,128}, xticklabels={2,4,8,16,32,64,128},
+    ymin=0, ymax=105, grid=major]
+\addplot coordinates {(2,2.6) (4,20.31) (8,62.42) (16,98.04) (32,100) (64,100) (128,100)};
+\end{axis}
+\end{tikzpicture}
+\caption{Experimento 5B: la poda por MBR degenera al escaneo completo a
+partir de $D \approx 32$ (R-Tree empaquetado, $N = 20\,000$, k-NN con
+$k{=}10$).}
+\label{fig:exp5dim}
+\end{figure}
+
+\paragraph{Análisis.}
+En dimensión alta las distancias entre puntos se \emph{concentran} (el
+vecino más lejano se vuelve casi tan cercano como el más próximo) y las
+cajas de los nodos cubren rangos casi completos en cada eje: su
+solapamiento es total. Ya en $D{=}16$ el 98\,\% de las hojas es
+inpodable; desde $D{=}32$ el árbol degenera exactamente en un escaneo
+secuencial (100\,\% de las páginas). Es la justificación teórica del
+Experimento 8: para embeddings ($D{=}512$) los índices de partición
+geométrica no sirven y se necesitan índices ANN como IVF, que no
+particionan por cajas sino por proximidad a centroides.
+
+\subsection{Experimento 6: índice invertido vs.\ Full Text Scan vs.\ GIN
+(PostgreSQL)}
+
+\paragraph{Parte A: escalabilidad de la construcción.}
+Corpus sintético determinístico de $N \in [10^3, 2\cdot10^3, 5\cdot10^3,
+10^4, 2\cdot10^4]$ documentos: vocabulario de 3\,000 términos con
+distribución Zipf, documentos de 20--60 palabras, semilla fija. Se mide
+el tiempo de \texttt{CREATE INDEX ... USING INVERTED} y el tamaño en
+disco de los cuatro archivos del índice (\texttt{.dic + .inv + .docs +
+.nrm}); como referencia se incluye la construcción del índice GIN
+equivalente de PostgreSQL~15 (\texttt{to\_tsvector('spanish', texto)}).
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 6A: construcción del índice invertido.}
+\label{tab:exp6build}
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+\rowcolor{utecblue!10}$N$ & \textbf{MiniDB (ms)} & \textbf{ms/doc} &
+\textbf{Tamaño (KB)} & \textbf{GIN PG (ms)} \\
+\midrule
+1\,000  & 201.1   & 0.201 & 379.4   & 89.3    \\
+2\,000  & 432.0   & 0.216 & 643.1   & 141.7   \\
+5\,000  & 1\,070.6 & 0.214 & 1\,417.0 & 311.1   \\
+10\,000 & 2\,172.2 & 0.217 & 2\,703.9 & 610.7   \\
+20\,000 & 3\,890.0 & 0.195 & 5\,276.4 & 1\,143.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La construcción es estrictamente lineal ($\approx$0.2 ms por documento,
+$R^2 \approx 1$) y el índice ocupa $\approx$264 bytes por documento: el
+costo lo domina la fusión de las listas de posteo en el \texttt{flush},
+no el vocabulario. PostgreSQL es $\sim$3.4$\times$ más rápido (C contra
+Python puro), con la misma linealidad.
+
+\paragraph{Parte B: latencia de consulta.}
+Consultas booleanas (AND, OR, AND-NOT) y Top-10 con
+\texttt{COSINE\_SCORE()} de 1, 3 y 5 términos de frecuencia media del
+corpus (rango Zipf 100--600), 20 repeticiones por celda (el Full Text
+Scan es O($N$) en Python puro, así que para $N \ge 5\,000$ se midieron
+4, 2 y 1 repeticiones; el CSV reporta el número exacto). La tabla
+muestra el caso representativo de 3 términos.
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 6B: latencia promedio por consulta (ms), consultas
+de 3 términos.}
+\label{tab:exp6ms}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{Variante} & $N{=}10^3$ & $N{=}2\cdot10^3$ &
+$N{=}5\cdot10^3$ & $N{=}10^4$ & $N{=}2\cdot10^4$ \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Consulta booleana}}\\
+Full Text Scan & 236.0 & 484.4 & 1\,231.0 & 2\,471.4 & 4\,918.6 \\
+Invertido      & \textbf{2.08} & \textbf{2.77} & \textbf{8.16} &
+\textbf{13.68} & \textbf{24.73} \\
+GIN (PG)       & 0.05 & 0.09 & 0.12 & 0.22 & 0.25 \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Top-10 con \texttt{COSINE\_SCORE()}}}\\
+Full Text Scan & 183.5 & 362.2 & 1\,012.3 & 1\,913.6 & 3\,545.9 \\
+Invertido      & \textbf{1.54} & \textbf{2.04} & \textbf{7.45} &
+\textbf{12.29} & \textbf{26.55} \\
+GIN (PG)       & 0.04 & 0.05 & 0.04 & 0.06 & 0.06 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 6B: bloques leídos promedio por consulta (MiniDB:
+DiskCounter; PostgreSQL: \texttt{shared read blocks} de
+\texttt{EXPLAIN (ANALYZE, BUFFERS)}).}
+\label{tab:exp6reads}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{Variante} & $N{=}10^3$ & $N{=}2\cdot10^3$ &
+$N{=}5\cdot10^3$ & $N{=}10^4$ & $N{=}2\cdot10^4$ \\
+\midrule
+Scan (bool y topk) & 85 & 171 & 426 & 852 & 1\,706 \\
+Invertido, booleana & 59.3 & 82.7 & 145.0 & 248.5 & 459.5 \\
+Invertido, top-10   & 51.2 & 56.7 & 65.9  & 81.0  & 111.0 \\
+GIN (PG)            & 0 & 0 & 0 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    estilodoc,
+    width=0.8\textwidth, height=6cm,
+    xlabel={$N$ (documentos)}, ylabel={Latencia (ms)},
+    xmode=log, ymode=log,
+    xtick={1000,2000,5000,10000,20000},
+    xticklabels={1k,2k,5k,10k,20k},
+    legend pos=north west, grid=major]
+\addplot coordinates {(1000,236.029) (2000,484.448) (5000,1230.968)
+    (10000,2471.437) (20000,4918.61)};
+\addlegendentry{Full Text Scan}
+\addplot coordinates {(1000,2.084) (2000,2.773) (5000,8.161)
+    (10000,13.681) (20000,24.733)};
+\addlegendentry{Índice invertido}
+\addplot coordinates {(1000,0.045) (2000,0.089) (5000,0.116)
+    (10000,0.223) (20000,0.249)};
+\addlegendentry{GIN (PostgreSQL)}
+\end{axis}
+\end{tikzpicture}
+\caption{Experimento 6B: latencia de la consulta booleana de 3 términos
+contra el tamaño del corpus (escala log-log). El scan crece con
+pendiente $\approx$1 (lineal en $N$); el índice invertido crece muy por
+debajo.}
+\label{fig:exp6}
+\end{figure}
+
+\paragraph{Análisis.}
+El Full Text Scan es $O(N)$ en ambas métricas: al multiplicar $N$ por 20
+la latencia se multiplica por $\sim$21 (236 $\to$ 4\,919 ms) y las
+lecturas son siempre el heap completo (85 $\to$ 1\,706 bloques),
+independientemente del número de términos de la consulta. El índice
+invertido desacopla el costo del tamaño del corpus: a $N{=}2\cdot10^4$
+es $\sim$\textbf{199$\times$} más rápido que el scan en la consulta
+booleana, y su latencia solo crece $\sim$12$\times$ para 20$\times$ más
+documentos porque depende de la frecuencia de los términos consultados,
+no de $N$.
+
+El desglose de lecturas del índice confirma el modelo de un motor de
+búsqueda real: la lista de posteo de cada término cuesta \emph{un} bloque
+(un \texttt{seek} + \texttt{read}), y el grueso de las lecturas
+contabilizadas corresponde a la recuperación de los registros
+calificados del heap (un \emph{RID fetch} por documento, como el
+\emph{heap fetch} de un Index Scan de PostgreSQL). Por eso la variante
+Top-10 lee menos que la booleana (111 vs.\ 460 bloques a
+$N{=}2\cdot10^4$): el ranking se calcula íntegramente sobre las listas
+de posteo y solo los 10 ganadores se traen del heap. El GIN de
+PostgreSQL reporta 0 bloques leídos porque el corpus completo cabe en su
+\texttt{shared\_buffers}; su latencia sub-milisegundo es la referencia
+de una implementación madura operando en memoria, y nuestro índice en
+disco queda del mismo orden de magnitud una vez descontado ese efecto de
+caché.
+
+\subsection{Experimento 7: paradigma clásico (BoVW) vs.\ moderno
+(embeddings)}
+
+Comparación de las dos vías de recuperación por contenido visual que
+soporta el motor, sobre la tabla \texttt{productos} de la aplicación de
+IA (600 imágenes de Natural Images en 6 categorías, que actúan como
+verdad terrenal: un resultado es \emph{relevante} si comparte la
+categoría de la consulta). Se emiten 60 consultas (10 productos por
+categoría, semilla fija) y se mide la efectividad semántica
+(Precision@5 y Precision@10, excluyendo el propio producto consulta),
+el tiempo de extracción de características y el costo de consulta en el
+motor.
+
+\begin{itemize}
+  \item \textbf{BoVW clásico}: descriptores SIFT asignados al codebook
+        (K-Means) $\to$ documento de \emph{palabras visuales} $\to$
+        consulta \texttt{bovw MATCH ...} rankeada con
+        \texttt{COSINE\_SCORE()} sobre el índice invertido.
+  \item \textbf{Embeddings densos}: vector ResNet-18 (512-D) $\to$
+        consulta \texttt{embedding \textless=\textgreater\ '[...]'}
+        resuelta por el índice IVF (distancia coseno).
+\end{itemize}
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 7: BoVW + índice invertido vs.\ embeddings + IVF
+(60 consultas, Top-10).}
+\label{tab:exp7}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{Paradigma} & \textbf{P@5} & \textbf{P@10} &
+\textbf{Extracción (ms)} & \textbf{Consulta (ms)} & \textbf{Bloques} \\
+\midrule
+BoVW + invertido   & 0.417 & 0.358 & \textbf{18.0}  & 12.2 &
+\textbf{81.0} \\
+Embedding + IVF    & \textbf{0.963} & \textbf{0.952} & 80.8 &
+\textbf{5.6} & 100.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Análisis.}
+El paradigma moderno gana de forma contundente en efectividad: recupera
+casi el doble de resultados relevantes (P@5 de 0.96 contra 0.42). La
+brecha es semántica, no del índice: los descriptores SIFT capturan
+textura local y se confunden entre categorías visualmente parecidas,
+mientras el embedding de la red convolucional codifica contenido de alto
+nivel. El costo del salto de calidad está en la \emph{extracción}:
+80.8 ms por imagen contra 18.0 ms del pipeline SIFT + asignación al
+codebook ($\sim$4.5$\times$). Ese costo se paga una sola vez por
+documento al indexarlo (queda materializado en la tabla), de modo que en
+régimen de consulta el paradigma moderno es además el más barato:
+5.6 ms contra 12.2 ms, porque el IVF recorre pocas listas cortas
+mientras el BoVW acumula decenas de listas de posteo (una por palabra
+visual de la consulta). Ambos paradigmas corren sobre el mismo motor sin
+código especial: el BoVW se expresa como texto sobre el índice invertido
+y el embedding como tipo \texttt{VECTOR} sobre el IVF.
+
+\subsection{Experimento 8: compromiso eficiencia--calidad en búsqueda
+ANN (IVF)}
+
+La búsqueda aproximada sacrifica exhaustividad por velocidad; este
+experimento mide esa frontera de forma explícita. Sobre la tabla
+\texttt{productos} (600 vectores de 512 dimensiones) se calcula primero
+la \emph{verdad base}: el Top-10 exacto por similitud coseno con el
+k-NN lineal del motor (\emph{Exact Vector Scan} sobre una copia de la
+tabla sin índice, 37.0 ms por consulta). Luego se barre
+$\texttt{probes} \in [1, 2, 5, 10, 20, 50]$ vía
+\texttt{SET ivf.probes} y, para 30 consultas aleatorias, se mide
+Recall@10 ($|\text{ANN} \cap \text{exacto}|/10$), latencia y bloques
+leídos.
+
+\begin{table}[!htb]
+\centering
+\caption{Experimento 8: Recall@10, latencia y lecturas según
+\texttt{probes} (30 consultas, Top-10; el k-NN exacto tarda 37.0 ms).}
+\label{tab:exp8}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+\rowcolor{utecblue!10}\textbf{probes} & \textbf{Recall@10} &
+\textbf{Latencia (ms)} & \textbf{Bloques leídos} \\
+\midrule
+1  & 0.757 & \textbf{1.47} & \textbf{88.9} \\
+2  & 0.920 & 1.97  & 114.1 \\
+5  & 0.980 & 3.40  & 186.5 \\
+10 & \textbf{1.000} & 9.21  & 300.5 \\
+20 & \textbf{1.000} & 12.09 & 553.9 \\
+50 & \textbf{1.000} & 17.15 & 660.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!htb]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    estilodoc,
+    width=0.8\textwidth, height=6cm,
+    xlabel={\texttt{probes} (listas visitadas)},
+    ylabel={Recall@10},
+    xmode=log, log basis x=2,
+    xtick={1,2,5,10,20,50}, xticklabels={1,2,5,10,20,50},
+    ymin=0.7, ymax=1.02, grid=major,
+    legend pos=south east]
+\addplot coordinates {(1,0.757) (2,0.920) (5,0.980) (10,1.000)
+    (20,1.000) (50,1.000)};
+\addlegendentry{Recall@10}
+\end{axis}
+\begin{axis}[
+    width=0.8\textwidth, height=6cm,
+    xmode=log, log basis x=2,
+    xtick={1,2,5,10,20,50}, xticklabels={1,2,5,10,20,50},
+    ymin=0, ymax=19,
+    axis y line*=right, axis x line=none,
+    ylabel={Latencia (ms)},
+    legend pos=north west]
+\addplot[dashed] coordinates {(1,1.47) (2,1.97) (5,3.40) (10,9.21)
+    (20,12.09) (50,17.15)};
+\addlegendentry{Latencia}
+\end{axis}
+\end{tikzpicture}
+\caption{Experimento 8: frontera de compromiso del IVF. Con
+\texttt{probes}${=10}$ se alcanza recall perfecto a una fracción del
+costo del k-NN exacto (9.2 ms contra 37.0 ms).}
+\label{fig:exp8}
+\end{figure}
+
+\paragraph{Análisis.}
+La curva exhibe la frontera de compromiso que caracteriza a los índices
+ANN: con \texttt{probes}${=1}$ el IVF es $\sim$25$\times$ más rápido que
+la búsqueda exacta (1.5 ms contra 37.0 ms) reteniendo el 76\,\% de los
+vecinos verdaderos; cada lista adicional que se visita cuesta
+$\sim$2--4 ms y $\sim$60--90 bloques (la lista invertida más el
+\emph{fetch} de sus candidatos del heap), y comprime la pérdida de
+recall hasta hacerla desaparecer en \texttt{probes}${=10}$: todos los
+vecinos verdaderos de estas consultas viven en las 10 listas cuyos
+centroides son más cercanos al vector consulta. Más allá de ese punto el
+índice degenera hacia el escaneo completo (50 listas $\approx$ recorrer
+todo el índice: 660 bloques) sin ganancia alguna de calidad. El
+parámetro queda expuesto al usuario vía \texttt{SET ivf.probes},
+permitiendo elegir el punto de operación según la exigencia de la
+aplicación (para este corpus, \texttt{probes} entre 5 y 10 es el punto
+de equilibrio: recall $\ge$0.98 a menos de un tercio del costo exacto).
+
 \section{Conclusiones}
 
 \begin{itemize}
@@ -707,6 +1304,32 @@ página del sistema operativo y equilibra ambos extremos.
         el árbol de 100\,000 claves baja de 3 a 2 niveles, reduciendo la
         búsqueda puntual de 3 a 2 lecturas físicas; el índice ocupa el mismo
         espacio, pero la construcción se encarece.
+\end{itemize}
+
+Conclusiones específicas del Entregable 2:
+
+\begin{itemize}
+  \item El R-Tree es excelente para consultas \emph{selectivas} (radio
+        pequeño, KNN con $k$ moderado: $\sim$23$\times$ menos lecturas
+        que el scan a $N{=}10^5$), pero su selectividad colapsa cuando la
+        región de consulta es grande, el mismo fenómeno que la maldición
+        de la dimensionalidad: en $D \ge 32$ la poda por MBR degenera al
+        100\,\% de las hojas y el árbol espacial equivale a un escaneo
+        secuencial.
+  \item El índice invertido en disco reproduce el comportamiento de un
+        motor de búsqueda real: solo las listas de posteo de los términos
+        de la consulta se traen de disco, con costo prácticamente
+        independiente del tamaño del corpus, frente a un Full Text Scan
+        cuyo costo crece linealmente con $N$.
+  \item El paradigma moderno (embeddings densos + IVF) supera al clásico
+        (BoVW + índice invertido) en efectividad semántica, a costa de un
+        tiempo de extracción de características mucho mayor (ResNet vs.\
+        SIFT+K-Means); ambos son viables sobre el mismo motor porque el
+        BoVW se expresa como texto sobre el índice invertido.
+  \item En búsqueda ANN existe una frontera de compromiso explícita y
+        controlable: el parámetro \texttt{probes} del IVF mueve la curva
+        Recall@10--latencia--I/O, lo que permite elegir el punto de
+        operación según la exigencia de la aplicación.
 \end{itemize}
 
 \end{document}

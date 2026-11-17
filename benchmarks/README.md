@@ -14,6 +14,10 @@ backend/.venv/bin/python benchmarks/exp1_insercion.py
 backend/.venv/bin/python benchmarks/exp2_busquedas.py
 backend/.venv/bin/python benchmarks/exp3_rangos.py
 backend/.venv/bin/python benchmarks/exp4_bloque.py
+backend/.venv/bin/python benchmarks/exp5_espacial.py
+backend/.venv/bin/python benchmarks/exp6_invertido.py --with-postgres
+backend/.venv/bin/python benchmarks/exp7_bovw_vs_embeddings.py
+backend/.venv/bin/python benchmarks/exp8_ann.py
 ```
 
 Los resultados se guardan en `benchmarks/results/` (gitignoreado) como CSV
@@ -79,3 +83,43 @@ lectura física).
   directamente, como los tests unitarios.
 - Resultado de referencia: fan-out interno 72 → 145 → 292 → 584, altura
   3,3,3,2 y reads de búsqueda 3.0 → 2.0 al duplicar B hasta 8 KB.
+
+## Experimentos del Entregable 2 (5–8)
+
+### `exp5_espacial.py` — R-Tree vs. secuencial + maldición de la dimensión
+
+Parte A: N ∈ [10k, 50k, 100k] puntos 2D uniformes en Lima; consultas de
+radio (0.005° y 0.05°) y k-NN (k ∈ [5, 20, 50]) contra el R-Tree del
+motor y contra el full scan del heap. Parte B: estudio independiente con
+un R-Tree N-dimensional empaquetado (STR): fracción de hojas que un k-NN
+(k=10) debe visitar según D ∈ [2, …, 128] — al llegar a ~100 % el árbol
+degenera en escaneo secuencial (resultado de referencia: 2.6 % en D=2,
+62 % en D=8, 100 % desde D=32).
+
+### `exp6_invertido.py` — índice invertido vs. Full Scan vs. GIN
+
+Corpus sintético determinístico (vocabulario Zipf de 3 000 términos,
+documentos de 20–60 palabras) escalado de 1 000 a 20 000 documentos:
+tiempo de construcción y tamaño en disco del INVERTED (`.dic` + `.inv` +
+`.docs` + `.nrm`), y latencia/lecturas de consultas booleanas (AND, OR,
+AND-NOT) y Top-K coseno de 1, 3 y 5 términos contra el Full Text Scan
+del motor y, con `--with-postgres`, contra el índice GIN de PostgreSQL
+(`to_tsvector('spanish')`, DSN del Lab 11 por defecto).
+
+### `exp7_bovw_vs_embeddings.py` — BoVW vs. embeddings densos
+
+Sobre la tabla `productos` preparada por
+`backend/scripts/prepare_recommender.py` (las categorías de Natural
+Images son la verdad terrenal): Precision@5 y Precision@10, tiempo de
+extracción de características y latencia/I-O de consulta para el
+paradigma clásico (SIFT + codebook + índice invertido) y el moderno
+(ResNet-18 + IVF).
+
+### `exp8_ann.py` — Recall@10 vs. probes (IVF)
+
+Verdad base: Top-10 exacto del k-NN lineal (copia de la tabla sin índice
+IVF, "Exact Vector Scan"). Curva de `probes` ∈ [1, 2, 5, 10, 20, 50]
+contra Recall@10 medio, latencia y lecturas de bloques (30 consultas).
+
+Los experimentos 7 y 8 asumen el dataset preparado (por defecto leen
+`backend/data`; sobreescribible con `--data-dir`).

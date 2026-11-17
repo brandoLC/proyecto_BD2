@@ -43,6 +43,8 @@ from ..storage.record import (
     TYPE_POINT,
     TYPE_TEXT,
     TYPE_VARCHAR,
+    TYPE_VECTOR,
+    coerce_vector,
 )
 from .parser import KEYWORDS
 
@@ -396,6 +398,8 @@ def cast_csv_value(raw: str, col: Column):
         return v
     if col.type == TYPE_TEXT:
         return v
+    if col.type == TYPE_VECTOR:
+        return coerce_vector(v, col)
     ok = False
     try:
         if col.type == TYPE_INT:

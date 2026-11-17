@@ -23,7 +23,7 @@ class TestAceptacion:
     def test_create_index_con_y_sin_nombre(self):
         ast = parse("CREATE INDEX idx ON t (c) USING BTREE")
         assert ast == {"type": "create_index", "name": "idx", "table": "t",
-                       "column": "c", "index_type": "BTREE"}
+                       "column": "c", "index_type": "BTREE", "params": {}}
         ast = parse("CREATE INDEX ON t (c) USING RTREE;")
         assert ast["name"] is None and ast["index_type"] == "RTREE"
 

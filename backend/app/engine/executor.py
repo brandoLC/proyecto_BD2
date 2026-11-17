@@ -9,6 +9,7 @@ utilizado, por ejemplo ``USING BTREE ON t.col``.
 
 from __future__ import annotations
 
+import collections
 import math
 import os
 import time
@@ -16,6 +17,8 @@ from typing import Callable
 
 from ..indexes.btree import BPlusTree
 from ..indexes.extendible_hash import ExtendibleHash
+from ..indexes.inverted_index import InvertedIndex
+from ..indexes.ivf import IVFIndex, METRICS as IVF_METRICS, vector_distance
 from ..indexes.rtree import RTree
 from ..storage.disk_counter import DiskCounter
 from ..storage.heap_file import HeapFile
@@ -26,14 +29,19 @@ from ..storage.record import (
     TYPE_FLOAT,
     TYPE_INT,
     TYPE_POINT,
+    TYPE_TEXT,
     TYPE_VARCHAR,
+    TYPE_VECTOR,
     coerce_value,
+    coerce_vector,
     decode_key,
     deserialize_row,
     encode_key,
     key_size,
     serialize_row,
 )
+from ..text.preprocess import TextPreprocessor
+from ..text.query_parser import MatchQueryError, parse_match_query
 from .catalog import Catalog
 from .csv_loader import (
     CSVError,
@@ -63,6 +71,14 @@ class ExecutionError(Exception):
 RID = tuple[int, int]
 
 INDEX_EXT = {"BTREE": "btree", "HASH": "hash", "RTREE": "rtree"}
+
+# Archivos físicos que componen un índice INVERTED (índice invertido):
+# diccionario, listas de posteo, mapa de documentos y normas L2.
+INVERTED_EXTS = ("dic", "inv", "docs", "nrm")
+
+# Archivos físicos de un índice IVF: directorio de centroides y listas
+# invertidas paginadas.
+IVF_EXTS = ("cen", "lst")
 
 # A partir de este número de filas, la verificación de unicidad de la PK
 # en carga masiva siembra un conjunto con las claves existentes en vez de
@@ -105,6 +121,8 @@ class Engine:
         self.catalog = Catalog(data_dir)
         self._auto_cache: dict[str, int] = {}  # siguiente valor por tabla
         self._seq_dirty: set[str] = set()
+        # Parámetros de sesión (sentencia SET): p. ej. {"ivf.probes": 5}
+        self._session: dict[str, int] = {}
         # Contador de I/O de la consulta en curso (None fuera de execute).
         self._counter: DiskCounter | None = None
 
@@ -118,6 +136,16 @@ class Engine:
         return os.path.join(
             self.data_dir, f"{table}_{column}.{INDEX_EXT[itype]}"
         )
+
+    def _index_paths(self, table: str, column: str, itype: str) -> list[str]:
+        """Todos los archivos físicos del índice (varios para INVERTED/IVF)."""
+        if itype == "INVERTED":
+            base = os.path.join(self.data_dir, f"{table}_{column}")
+            return [f"{base}.{ext}" for ext in INVERTED_EXTS]
+        if itype == "IVF":
+            base = os.path.join(self.data_dir, f"{table}_{column}")
+            return [f"{base}.{ext}" for ext in IVF_EXTS]
+        return [self._index_path(table, column, itype)]
 
     def _open_heap(self, table: str, create: bool = False) -> HeapFile:
         return HeapFile(self._heap_path(table), create=create,
@@ -195,6 +223,37 @@ class Engine:
                      create=create, counter=self._counter)
 
     # ------------------------------------------------------------------
+    # Índice invertido (módulo textual)
+    # ------------------------------------------------------------------
+    def _open_inverted(self, table: str, col: Column,
+                       create: bool = False) -> InvertedIndex:
+        base = os.path.join(self.data_dir, f"{table}_{col.name}")
+        return InvertedIndex(base, create=create, counter=self._counter)
+
+    def _inverted_params(self, table: str, col_name: str) -> dict:
+        """Parámetros WITH del índice INVERTED de la columna."""
+        meta = self.catalog.index_on(table, col_name, {"INVERTED"})
+        return (meta or {}).get("params") or {}
+
+    @staticmethod
+    def _preprocessor(params: dict) -> TextPreprocessor:
+        """Preprocesador del índice (idioma de sus parámetros WITH)."""
+        return TextPreprocessor(params.get("language", "spanish"))
+
+    # ------------------------------------------------------------------
+    # Índice vectorial IVF
+    # ------------------------------------------------------------------
+    def _open_ivf(self, table: str, col: Column,
+                  create: bool = False) -> IVFIndex:
+        base = os.path.join(self.data_dir, f"{table}_{col.name}")
+        return IVFIndex(base, create=create, counter=self._counter)
+
+    def _ivf_params(self, table: str, col_name: str) -> dict:
+        """Parámetros WITH del índice IVF de la columna."""
+        meta = self.catalog.index_on(table, col_name, {"IVF"})
+        return (meta or {}).get("params") or {}
+
+    # ------------------------------------------------------------------
     # Entrada principal
     # ------------------------------------------------------------------
     def execute(self, sql: str) -> dict:
@@ -249,7 +308,24 @@ class Engine:
             return self._exec_delete(ast, plan)
         if kind == "drop_table":
             return self._exec_drop_table(ast, plan)
+        if kind == "set":
+            return self._exec_set(ast, plan)
         raise ExecutionError(f"sentencia no soportada: {kind}")
+
+    # ------------------------------------------------------------------
+    # SET parametro = valor (sesión)
+    # ------------------------------------------------------------------
+    def _exec_set(self, ast: dict, plan: _Plan) -> dict:
+        """Aplica un parámetro de sesión (``SET ivf.probes = 5``)."""
+        t = time.perf_counter()
+        param = ast["param"]
+        if param not in ("ivf.probes",):
+            raise SemanticError(
+                f"parámetro desconocido: {param!r} (disponible: ivf.probes)")
+        self._session[param] = ast["value"]
+        plan.add("Set Session Param", f"{param} = {ast['value']}", t)
+        return {"kind": "set",
+                "message": f"Parámetro {param} = {ast['value']}"}
 
     # ------------------------------------------------------------------
     # DROP TABLE
@@ -267,8 +343,8 @@ class Engine:
         else:
             paths = [self._heap_path(table)]
         for meta in self.catalog.indexes(table):
-            paths.append(self._index_path(table, meta["column"],
-                                          meta["type"]))
+            paths.extend(self._index_paths(table, meta["column"],
+                                           meta["type"]))
         removed = 0
         for p in paths:
             if os.path.isfile(p):
@@ -351,6 +427,9 @@ class Engine:
         auto_pk = next((c.name for c in columns if c.auto), None)
         organization = ast.get("organization", "heap")
         pk_col = next(c for c in columns if c.primary_key)
+        if pk_col.type == TYPE_VECTOR:
+            raise SemanticError(
+                "una columna VECTOR(n) no puede ser PRIMARY KEY")
         if organization == "sequential" and pk_col.type == TYPE_POINT:
             raise SemanticError(
                 "la PK de una tabla SEQUENTIAL no puede ser POINT")
@@ -389,7 +468,7 @@ class Engine:
         de acceso de la PK, así que no se genera índice.
         """
         pk = next((c for c in columns if c.primary_key), None)
-        if pk is None or pk.type == TYPE_POINT:
+        if pk is None or pk.type in (TYPE_POINT, TYPE_VECTOR):
             return
         if self.catalog.organization(table) == "sequential":
             return
@@ -553,14 +632,49 @@ class Engine:
     # ------------------------------------------------------------------
     def _exec_create_index(self, ast: dict, plan: _Plan) -> dict:
         table, col_name, itype = ast["table"], ast["column"], ast["index_type"]
+        params = ast.get("params") or {}
         t = time.perf_counter()
         self._get_columns(table)
         col = self._get_column(table, col_name)
         if itype == "RTREE":
             if col.type != TYPE_POINT:
                 raise SemanticError("RTREE solo se permite sobre columnas POINT")
+        elif itype == "INVERTED":
+            if col.type not in (TYPE_TEXT, TYPE_VARCHAR):
+                raise SemanticError(
+                    "INVERTED solo se permite sobre columnas TEXT o VARCHAR")
+            scoring = str(params.get("scoring", "TFIDF_COSINE")).upper()
+            if scoring not in ("TFIDF_COSINE",):
+                raise SemanticError(
+                    f"scoring no soportado: {scoring!r} "
+                    f"(disponible: TFIDF_COSINE)")
+            params["scoring"] = scoring
+            language = str(params.get("language", "spanish")).lower()
+            try:
+                TextPreprocessor(language)
+            except ValueError as exc:
+                raise SemanticError(str(exc)) from exc
+            params["language"] = language
+        elif itype == "IVF":
+            if col.type != TYPE_VECTOR:
+                raise SemanticError(
+                    "IVF solo se permite sobre columnas VECTOR(n)")
+            metric = str(params.get("metric", "L2")).upper()
+            if metric not in IVF_METRICS:
+                raise SemanticError(
+                    f"métrica no soportada: {metric!r} "
+                    f"(disponibles: {', '.join(IVF_METRICS)})")
+            params["metric"] = metric
+            if "lists" in params:
+                lists = params["lists"]
+                if not isinstance(lists, int) or lists <= 0:
+                    raise SemanticError(
+                        "el parámetro lists requiere un entero positivo")
         elif col.type == TYPE_POINT:
             raise SemanticError(f"{itype} no soporta columnas POINT")
+        elif col.type == TYPE_VECTOR:
+            raise SemanticError(f"{itype} no soporta columnas VECTOR "
+                                f"(usar IVF)")
         if self.catalog.index_on(table, col_name, {itype}):
             raise SemanticError(
                 f"ya existe un índice {itype} sobre {table}.{col_name}")
@@ -577,36 +691,89 @@ class Engine:
 
         t = time.perf_counter()
         heap = self._open_storage(table)
-        if itype == "BTREE":
-            idx = self._open_btree(table, col, create=True)
-        elif itype == "HASH":
-            idx = self._open_hash(table, col, create=True)
+        if itype == "INVERTED":
+            idx = self._open_inverted(table, col, create=True)
+            pre = self._preprocessor(params)
+            plan.add("Create Index File",
+                     ", ".join(os.path.basename(p)
+                               for p in self._index_paths(table, col_name,
+                                                          itype)), t)
+            t = time.perf_counter()
+            col_pos = [c.name for c in self.catalog.columns(table)
+                       ].index(col_name)
+            n = 0
+            for rid, raw in self._scan_rows(heap):
+                row = deserialize_row(self.catalog.columns(table), raw)
+                idx.add_document(rid, pre.terms(str(row[col_pos])))
+                n += 1
+            idx.flush()
+            idx.close()
+            heap.close()
+            plan.add("Bulk Load",
+                     f"{n} documentos indexados con INVERTED "
+                     f"(idioma {params['language']})", t)
+        elif itype == "IVF":
+            t = time.perf_counter()
+            col_pos = [c.name for c in self.catalog.columns(table)
+                       ].index(col_name)
+            vectors = []
+            for rid, raw in self._scan_rows(heap):
+                row = deserialize_row(self.catalog.columns(table), raw)
+                vectors.append((rid, tuple(row[col_pos])))
+            heap.close()
+            n = len(vectors)
+            if n == 0:
+                raise SemanticError(
+                    f"no se puede crear un índice IVF: la tabla "
+                    f"'{table}' está vacía")
+            lists = params.get("lists") or max(1, int(math.floor(
+                math.sqrt(n))))
+            params["lists"] = lists
+            idx = self._open_ivf(table, col, create=True)
+            plan.add("Create Index File",
+                     ", ".join(os.path.basename(p)
+                               for p in self._index_paths(table, col_name,
+                                                          itype)), t)
+            t = time.perf_counter()
+            idx.build(vectors, dim=col.size, n_clusters=lists,
+                      metric=params["metric"])
+            idx.close()
+            plan.add("K-Means + Bulk Load",
+                     f"{n} vectores en {lists} celdas "
+                     f"(métrica {params['metric']})", t)
         else:
-            idx = self._open_rtree(table, col, create=True)
-        plan.add("Create Index File",
-                 os.path.basename(self._index_path(table, col_name, itype)), t)
-
-        t = time.perf_counter()
-        col_pos = [c.name for c in self.catalog.columns(table)].index(col_name)
-        if hasattr(idx, "defer_header"):  # BPlusTree/RTree
-            idx.defer_header = True
-        if hasattr(idx, "defer_flush"):  # BPlusTree/RTree/ExtendibleHash
-            idx.defer_flush = True
-        n = 0
-        for rid, raw in self._scan_rows(heap):
-            row = deserialize_row(self.catalog.columns(table), raw)
-            value = row[col_pos]
-            if itype == "RTREE":
-                idx.insert(tuple(value), rid)
+            if itype == "BTREE":
+                idx = self._open_btree(table, col, create=True)
+            elif itype == "HASH":
+                idx = self._open_hash(table, col, create=True)
             else:
-                idx.insert(value, rid)
-            n += 1
-        idx.close()
-        heap.close()
-        plan.add("Bulk Load", f"{n} registros indexados con {itype}", t)
+                idx = self._open_rtree(table, col, create=True)
+            plan.add("Create Index File",
+                     os.path.basename(
+                         self._index_path(table, col_name, itype)), t)
+
+            t = time.perf_counter()
+            col_pos = [c.name for c in self.catalog.columns(table)
+                       ].index(col_name)
+            if hasattr(idx, "defer_header"):  # BPlusTree/RTree
+                idx.defer_header = True
+            if hasattr(idx, "defer_flush"):  # BPlusTree/RTree/ExtendibleHash
+                idx.defer_flush = True
+            n = 0
+            for rid, raw in self._scan_rows(heap):
+                row = deserialize_row(self.catalog.columns(table), raw)
+                value = row[col_pos]
+                if itype == "RTREE":
+                    idx.insert(tuple(value), rid)
+                else:
+                    idx.insert(value, rid)
+                n += 1
+            idx.close()
+            heap.close()
+            plan.add("Bulk Load", f"{n} registros indexados con {itype}", t)
 
         t = time.perf_counter()
-        self.catalog.add_index(table, idx_name, col_name, itype)
+        self.catalog.add_index(table, idx_name, col_name, itype, params)
         plan.add("Update Catalog", "catalog.json persistido", t)
         return {"kind": "create_index",
                 "message": f"Índice '{idx_name}' ({itype}) creado "
@@ -721,13 +888,23 @@ class Engine:
             col = self._get_column(table, meta["column"])
             col_pos = [c.name for c in columns].index(col.name)
             value = row[col_pos]
-            if meta["type"] == "BTREE":
-                idx = self._open_btree(table, col)
-            elif meta["type"] == "HASH":
-                idx = self._open_hash(table, col)
+            if meta["type"] == "INVERTED":
+                idx = self._open_inverted(table, col)
+                pre = self._preprocessor(
+                    self._inverted_params(table, col.name))
+                idx.add_document(rid, pre.terms(str(value)))
+            elif meta["type"] == "IVF":
+                idx = self._open_ivf(table, col)
+                idx.add(rid, tuple(value))
             else:
-                idx = self._open_rtree(table, col)
-            idx.insert(tuple(value) if col.type == TYPE_POINT else value, rid)
+                if meta["type"] == "BTREE":
+                    idx = self._open_btree(table, col)
+                elif meta["type"] == "HASH":
+                    idx = self._open_hash(table, col)
+                else:
+                    idx = self._open_rtree(table, col)
+                idx.insert(tuple(value) if col.type == TYPE_POINT else value,
+                           rid)
             idx.close()
             if plan is not None:
                 plan.add("Index Maintenance",
@@ -739,6 +916,10 @@ class Engine:
             return self._open_btree(table, col)
         if itype == "HASH":
             return self._open_hash(table, col)
+        if itype == "INVERTED":
+            return self._open_inverted(table, col)
+        if itype == "IVF":
+            return self._open_ivf(table, col)
         return self._open_rtree(table, col)
 
     def bulk_load_rows(self, table: str,
@@ -777,15 +958,18 @@ class Engine:
         heap.defer_flush = True
         sequential = isinstance(heap, SequentialFile)
         col_names = [c.name for c in columns]
-        idx_entries: list[tuple[dict, Column, int, object]] = []
+        idx_entries: list[tuple[dict, Column, int, object, object]] = []
         for meta in self.catalog.indexes(table):
             col = self.catalog.column(table, meta["column"])
             idx = self._open_index(table, meta["type"], col)
             if hasattr(idx, "defer_header"):  # BPlusTree/RTree
                 idx.defer_header = True
-            idx.defer_flush = True  # write-back durante toda la carga
+            if hasattr(idx, "defer_flush"):
+                idx.defer_flush = True  # write-back durante toda la carga
+            pre = (self._preprocessor(meta.get("params") or {})
+                   if meta["type"] == "INVERTED" else None)
             idx_entries.append(
-                (meta, col, col_names.index(col.name), idx))
+                (meta, col, col_names.index(col.name), idx, pre))
         pk_idx = next(
             (e for e in idx_entries
              if pk is not None and e[1].name == pk.name
@@ -862,10 +1046,15 @@ class Engine:
                                           serialize_row(columns, row))
                     else:
                         rid = heap.insert(serialize_row(columns, row))
-                    for _meta, col, col_pos, idx in idx_entries:
+                    for _meta, col, col_pos, idx, pre in idx_entries:
                         v = row[col_pos]
-                        idx.insert(tuple(v) if col.type == TYPE_POINT
-                                   else v, rid)
+                        if _meta["type"] == "INVERTED":
+                            idx.add_document(rid, pre.terms(str(v)))
+                        elif _meta["type"] == "IVF":
+                            idx.add(rid, tuple(v))
+                        else:
+                            idx.insert(tuple(v) if col.type == TYPE_POINT
+                                       else v, rid)
                 except (ValueError, SerializationError,
                         ExecutionError) as exc:
                     rejected += 1
@@ -876,7 +1065,7 @@ class Engine:
                 loaded += 1
         finally:
             heap.close()
-            for _meta, _col, _pos, idx in idx_entries:
+            for _meta, _col, _pos, idx, _pre in idx_entries:
                 idx.close()
         self._flush_seq()
         return {"rows_loaded": loaded, "rows_rejected": rejected,
@@ -886,37 +1075,93 @@ class Engine:
     # SELECT
     # ------------------------------------------------------------------
     def _exec_select(self, ast: dict, plan: _Plan) -> dict:
-        if any(isinstance(c, dict) for c in ast["columns"]):
+        items = ast["columns"]
+        if any(isinstance(c, dict) and c["agg"] is not None for c in items):
             return self._exec_aggregate_select(ast, plan)
         table = ast["table"]
         t = time.perf_counter()
         columns = self._get_columns(table)
         col_map = {c.name: c for c in columns}
-        if ast["columns"] == ["*"]:
+        # Modo enriquecido: items como diccionarios (alias AS y/o
+        # COSINE_SCORE()). `selected` lleva solo columnas reales; el
+        # puntaje se proyecta aparte al final de cada fila.
+        score_item: dict | None = None
+        vdist_item: dict | None = None
+        vdist_alias: str | None = None
+        aliases: dict[str, str] = {}
+        if items == ["*"]:
             selected = [c.name for c in columns]
+        elif any(isinstance(c, dict) for c in items):
+            selected = []
+            for it in items:
+                if it.get("score"):
+                    if score_item is not None:
+                        raise SemanticError(
+                            "solo se permite un COSINE_SCORE() por consulta")
+                    score_item = it
+                    continue
+                if it.get("vdist"):
+                    if vdist_item is not None:
+                        raise SemanticError(
+                            "solo se permite una distancia vectorial "
+                            "por consulta")
+                    vdist_item = it["vdist"]
+                    vdist_alias = it.get("alias")
+                    continue
+                if it["column"] not in col_map:
+                    raise SemanticError(
+                        f"la columna '{it['column']}' no existe en '{table}'")
+                selected.append(it["column"])
+                if it.get("alias"):
+                    aliases[it["column"]] = it["alias"]
         else:
-            for name in ast["columns"]:
+            for name in items:
                 if name not in col_map:
                     raise SemanticError(
                         f"la columna '{name}' no existe en '{table}'")
-            selected = ast["columns"]
+            selected = items
         where = ast["where"]
         if where is not None:
             self._check_where_columns(table, where)
+        match_cond = self._match_condition(where)
+        if score_item is not None and match_cond is None:
+            raise SemanticError(
+                "COSINE_SCORE() requiere una condición MATCH en el WHERE")
+        if vdist_item is not None:
+            if score_item is not None:
+                raise SemanticError(
+                    "no se puede combinar COSINE_SCORE() con una "
+                    "distancia vectorial en la misma consulta")
+            return self._exec_vector_select(
+                ast, plan, columns, selected, aliases,
+                vdist_item, vdist_alias)
+        if ast.get("order_by") and score_item is None \
+                and self._knn_condition(where) is None:
+            raise SemanticError(
+                "ORDER BY solo se soporta en consultas con ranking "
+                "(COSINE_SCORE o KNN)")
+        # La condición MATCH se anota como "ranked" cuando la consulta pide
+        # COSINE_SCORE(): deja de ser un predicado booleano y pasa a ser un
+        # ranking Top-K (igual que KNN). La anotación viaja en el propio
+        # árbol WHERE hacia _plan_access y _match.
+        if match_cond is not None:
+            match_cond["ranked"] = score_item is not None
         plan.add("Semantic Check", f"tabla '{table}' y columnas válidas", t)
 
         # Acceso a datos: índice si existe, si no escaneo secuencial
+        limit = ast["limit"]
+        offset = ast["offset"] or 0
+        limit_hint = (offset + limit) if limit is not None else SELECT_ROW_CAP
         rids: list[RID] | None = None  # None => escaneo secuencial
         ordered_knn: list[tuple[RID, float]] | None = None
         residual: dict | None = None  # condiciones del AND fuera del acceso
         if where is not None:
-            rids, ordered_knn, residual = self._plan_access(table, where, plan)
+            rids, ordered_knn, residual = self._plan_access(
+                table, where, plan, limit_hint=limit_hint)
         knn_cond = self._knn_condition(where)
 
         t = time.perf_counter()
         heap = self._open_storage(table)
-        limit = ast["limit"]
-        offset = ast["offset"] or 0
         # Semántica SQL estándar: saltar las primeras `offset` filas del
         # resultado y luego aplicar el límite. Con LIMIT explícito el
         # escaneo junta offset+limit filas que cumplen (pushdown); sin
@@ -927,14 +1172,21 @@ class Engine:
         else:
             stop_at = SELECT_ROW_CAP + 1  # +1: sondeo para detectar truncated
         truncated = False
+        # MATCH con ranking sin índice INVERTED: ranking TF-IDF por fuerza
+        # bruta sobre el escaneo completo (línea base del Experimento 6).
+        ranked_scan = (score_item is not None and rids is None
+                       and match_cond is not None)
+        score_map: dict[RID, float] = {}
         if rids is None:  # escaneo secuencial
             # El LIMIT se empuja al escaneo: se detiene apenas junta las
-            # filas pedidas (salvo KNN por fuerza bruta, que necesita todas).
-            early_stop = knn_cond is None
+            # filas pedidas (salvo KNN o MATCH con ranking por fuerza
+            # bruta, que necesitan todas las filas para ordenar).
+            early_stop = knn_cond is None and not ranked_scan
             rows = []
             for rid, raw in self._scan_rows(heap):
                 row = deserialize_row(columns, raw)
-                if where is not None and not self._match(columns, where, row):
+                if where is not None and not self._match(
+                        columns, where, row, table):
                     continue
                 rows.append((rid, row))
                 if early_stop and len(rows) >= stop_at:
@@ -947,18 +1199,28 @@ class Engine:
                 rows.sort(key=lambda t: math.hypot(t[1][pos][0] - cx,
                                                    t[1][pos][1] - cy))
                 rows = rows[: knn_cond["k"]]
+            elif ranked_scan:
+                scored_rows = self._fulltext_rank(
+                    table, columns, rows, match_cond, stop_at)
+                score_map = {rid: s for rid, _row, s in scored_rows}
+                rows = [(rid, row) for rid, row, _s in scored_rows]
             # OFFSET/LIMIT (o el tope de seguridad) sobre el resultado.
-            if limit is not None:
-                rows = rows[offset:offset + limit]
-            else:
-                truncated = len(rows) > SELECT_ROW_CAP
-                rows = rows[:SELECT_ROW_CAP]
+            # (Con ranking la ventana se aplica tras la proyección y el
+            # ORDER BY.)
+            if not ranked_scan:
+                if limit is not None:
+                    rows = rows[offset:offset + limit]
+                else:
+                    truncated = len(rows) > SELECT_ROW_CAP
+                    rows = rows[:SELECT_ROW_CAP]
         elif ordered_knn is not None:
+            if score_item is not None:
+                score_map = {rid: s for rid, s in ordered_knn}
             rows = []
             for rid, _d in ordered_knn:
                 row = deserialize_row(columns, self._read_row(heap, rid))
                 if residual is not None and not self._match(
-                        columns, residual, row):
+                        columns, residual, row, table):
                     continue
                 rows.append((rid, row))
             fetched = len(rows)
@@ -971,7 +1233,7 @@ class Engine:
             for rid in rids:
                 row = deserialize_row(columns, self._read_row(heap, rid))
                 fetched += 1
-                if not self._match(columns, residual, row):
+                if not self._match(columns, residual, row, table):
                     continue
                 rows.append((rid, row))
                 if len(rows) >= stop_at:
@@ -997,14 +1259,28 @@ class Engine:
         t = time.perf_counter()
         positions = [[c.name for c in columns].index(name) for name in selected]
         out_rows = [[row[i] for i in positions] for _, row in rows]
-        if ordered_knn is not None:
-            # KNN por R-Tree: offset/limit sobre el resultado ordenado.
+        out_names = [aliases.get(n, n) for n in selected]
+        if score_item is not None:
+            for out_r, (rid, _row) in zip(out_rows, rows):
+                out_r.append(round(score_map.get(rid, 0.0), 6))
+            out_names.append(score_item.get("alias") or "cosine_score")
+        if ordered_knn is not None or ranked_scan:
+            # ORDER BY sobre el resultado ordenado (ranking), antes de la
+            # ventana OFFSET/LIMIT (semántica SQL estándar).
+            if ast.get("order_by"):
+                ob = ast["order_by"]
+                if ob not in out_names:
+                    raise SemanticError(
+                        f"ORDER BY: la columna '{ob}' no está en el SELECT")
+                oi = out_names.index(ob)
+                out_rows.sort(key=lambda r: (r[oi] is None, r[oi]),
+                              reverse=ast["order_dir"] == "desc")
             if limit is not None:
                 out_rows = out_rows[offset:offset + limit]
             elif len(out_rows) > SELECT_ROW_CAP:
                 out_rows = out_rows[:SELECT_ROW_CAP]
                 truncated = True
-        plan.add("Projection", f"columnas: {', '.join(selected)}", t)
+        plan.add("Projection", f"columnas: {', '.join(out_names)}", t)
         if limit is not None:
             t = time.perf_counter()
             detail = f"máximo {limit} filas"
@@ -1015,7 +1291,7 @@ class Engine:
         spatial = self._spatial_payload(columns, selected, out_rows)
         return {
             "kind": "select",
-            "columns": selected,
+            "columns": out_names,
             "rows": [[list(v) if isinstance(v, tuple) else v for v in row]
                      for row in out_rows],
             "rowcount": len(out_rows),
@@ -1023,6 +1299,177 @@ class Engine:
             "spatial": spatial,
             "truncated": truncated,
         }
+
+    # ------------------------------------------------------------------
+    # SELECT con distancia vectorial (embedding <-> / <=> 'query')
+    # ------------------------------------------------------------------
+    def _exec_vector_select(self, ast: dict, plan: _Plan,
+                            columns: list[Column], selected: list[str],
+                            aliases: dict[str, str], vdist: dict,
+                            vdist_alias: str | None) -> dict:
+        """Búsqueda por similitud de embeddings con planificador híbrido.
+
+        Estrategia (reportada en el plan, como exige el enunciado):
+
+        - **Pre-filtering**: si el WHERE tiene vía de acceso por índice
+          relacional (B+/Hash/R-Tree), se recuperan esos RIDs y se
+          calcula la distancia exacta solo sobre ellos.
+        - **Post-filtering**: si no hay índice relacional pero sí IVF,
+          el ANN devuelve candidatos y el WHERE filtra después.
+        - **ANN puro**: sin WHERE, Top-K directo del IVF (probes del
+          parámetro de sesión ``ivf.probes``, por defecto 1).
+        - **Exact Vector Scan**: sin ningún índice, k-NN lineal por
+          fuerza bruta (línea base / ground truth del Experimento 8).
+        """
+        table = ast["table"]
+        t = time.perf_counter()
+        col = self._get_column(table, vdist["column"])
+        if col.type != TYPE_VECTOR:
+            raise SemanticError(
+                f"el operador {vdist['op']} requiere una columna "
+                f"VECTOR(n), '{col.name}' es {col.type_str()}")
+        query = coerce_vector(vdist["query"], col)
+        metric = "COSINE" if vdist["op"] == "<=>" else "L2"
+        where = ast["where"]
+        if where is not None:
+            self._check_where_columns(table, where)
+        plan.add("Semantic Check",
+                 f"distancia {metric} sobre {table}.{col.name}", t)
+
+        limit = ast["limit"]
+        offset = ast["offset"] or 0
+        k = (offset + limit) if limit is not None else SELECT_ROW_CAP
+        pos = [c.name for c in columns].index(col.name)
+
+        ivf_meta = self.catalog.index_on(table, col.name, {"IVF"})
+        if ivf_meta is not None:
+            idx_metric = (ivf_meta.get("params") or {}).get("metric", "L2")
+            if idx_metric != metric:
+                raise SemanticError(
+                    f"el índice IVF de {table}.{col.name} es {idx_metric}: "
+                    f"usar el operador "
+                    f"{'<=>' if idx_metric == 'COSINE' else '<->'} "
+                    f"o recrear el índice con metric = '{metric}'")
+
+        scored: list[tuple[RID, list, float]]
+        truncated = False
+        t = time.perf_counter()
+        heap = self._open_storage(table)
+        if where is not None:
+            rids, _ordered, residual = self._plan_access(table, where, plan)
+            if rids is not None:
+                # Pre-filtering: el índice relacional acota los candidatos.
+                scored = []
+                for rid in rids:
+                    row = deserialize_row(columns, self._read_row(heap, rid))
+                    if residual is not None and not self._match(
+                            columns, residual, row, table):
+                        continue
+                    scored.append((rid, row,
+                                   vector_distance(query, row[pos], metric)))
+                scored.sort(key=lambda t2: t2[2])
+                total = len(scored)
+                scored = scored[:k]
+                truncated = limit is None and total > SELECT_ROW_CAP
+                strategy = ("Pre-filtering (índice relacional + "
+                            "distancia exacta sobre los RIDs filtrados)")
+            elif ivf_meta is not None:
+                # Post-filtering: el ANN recupera candidatos y el WHERE
+                # filtra después.
+                probes = self._session.get("ivf.probes", 1)
+                t2 = time.perf_counter()
+                idx = self._open_ivf(table, col)
+                ann = idx.search(query, probes, k)
+                idx.close()
+                plan.add("IVF ANN Scan",
+                         f"USING IVF ON {table}.{col.name} probes={probes} "
+                         f"-> {len(ann)} candidatos", t2)
+                scored = []
+                for rid, d in ann:
+                    row = deserialize_row(columns, self._read_row(heap, rid))
+                    if not self._match(columns, where, row, table):
+                        continue
+                    scored.append((rid, row, d))
+                strategy = (f"Post-filtering (ANN con probes={probes} + "
+                            f"filtro WHERE sobre candidatos)")
+            else:
+                scored = self._exact_vector_scan(
+                    heap, columns, pos, query, metric, where, table)
+                total = len(scored)
+                scored = scored[:k]
+                truncated = limit is None and total > SELECT_ROW_CAP
+                strategy = "Exact Vector Scan (k-NN lineal por fuerza bruta)"
+        elif ivf_meta is not None:
+            probes = self._session.get("ivf.probes", 1)
+            t2 = time.perf_counter()
+            idx = self._open_ivf(table, col)
+            ann = idx.search(query, probes, k)
+            idx.close()
+            plan.add("IVF ANN Scan",
+                     f"USING IVF ON {table}.{col.name} probes={probes} "
+                     f"-> {len(ann)} candidatos", t2)
+            scored = [(rid,
+                       deserialize_row(columns, self._read_row(heap, rid)), d)
+                      for rid, d in ann]
+            strategy = f"ANN puro (IVF con probes={probes}, sin WHERE)"
+        else:
+            scored = self._exact_vector_scan(
+                heap, columns, pos, query, metric, None, table)
+            total = len(scored)
+            scored = scored[:k]
+            truncated = limit is None and total > SELECT_ROW_CAP
+            strategy = "Exact Vector Scan (k-NN lineal por fuerza bruta)"
+        heap.close()
+        plan.add("Fetch Rows", f"{len(scored)} candidatos evaluados", t)
+        plan.add("Vector Strategy", strategy, t)
+
+        t = time.perf_counter()
+        positions = [[c.name for c in columns].index(name)
+                     for name in selected]
+        out_rows = [[row[i] for i in positions] + [round(d, 6)]
+                    for _rid, row, d in scored]
+        dist_name = vdist_alias or ("dist_coseno" if metric == "COSINE"
+                                    else "dist_l2")
+        out_names = [aliases.get(n, n) for n in selected] + [dist_name]
+        # ORDER BY: por defecto la distancia ascendente; con ORDER BY se
+        # ordena por la columna pedida antes de la ventana OFFSET/LIMIT.
+        if ast.get("order_by"):
+            ob = ast["order_by"]
+            if ob not in out_names:
+                raise SemanticError(
+                    f"ORDER BY: la columna '{ob}' no está en el SELECT")
+            oi = out_names.index(ob)
+            out_rows.sort(key=lambda r: (r[oi] is None, r[oi]),
+                          reverse=ast["order_dir"] == "desc")
+        if limit is not None:
+            out_rows = out_rows[offset:offset + limit]
+        plan.add("Projection", f"columnas: {', '.join(out_names)}", t)
+        return {
+            "kind": "select",
+            "columns": out_names,
+            "rows": [[list(v) if isinstance(v, tuple) else v for v in row]
+                     for row in out_rows],
+            "rowcount": len(out_rows),
+            "message": "OK",
+            "spatial": None,
+            "truncated": truncated,
+        }
+
+    def _exact_vector_scan(self, heap, columns: list[Column], pos: int,
+                           query, metric: str, where: dict | None,
+                           table: str) -> list[tuple[RID, list, float]]:
+        """k-NN lineal exacto: distancia a todas las filas (que cumplan el
+        WHERE) ordenada ascendente. Línea base del Experimento 8."""
+        scored = []
+        for rid, raw in self._scan_rows(heap):
+            row = deserialize_row(columns, raw)
+            if where is not None and not self._match(columns, where, row,
+                                                     table):
+                continue
+            scored.append((rid, row, vector_distance(query, row[pos],
+                                                     metric)))
+        scored.sort(key=lambda t: t[2])
+        return scored
 
     # ------------------------------------------------------------------
     # SELECT con agregación (un solo grupo, sin GROUP BY)
@@ -1100,7 +1547,7 @@ class Engine:
                 for rid in rids:
                     row = deserialize_row(columns, self._read_row(heap, rid))
                     if residual is not None and not self._match(
-                            columns, residual, row):
+                            columns, residual, row, table):
                         continue
                     count += 1
                     if needs_values:
@@ -1110,7 +1557,7 @@ class Engine:
                 fetched += 1
                 if where is not None:
                     row = deserialize_row(columns, raw)
-                    if not self._match(columns, where, row):
+                    if not self._match(columns, where, row, table):
                         continue
                 elif needs_values:
                     row = deserialize_row(columns, raw)
@@ -1181,13 +1628,19 @@ class Engine:
 
     def _access_score(self, table: str, cond: dict) -> int:
         """Prioridad de una condición como método de acceso:
-        4 = KNN (siempre gobierna: es top-k ordenado, no un predicado),
+        4 = KNN o MATCH con ranking (siempre gobierna: es top-k ordenado,
+            no un predicado; también sin índice: fuerza su rol de driver),
         3 = igualdad con índice (o búsqueda binaria en PK sequential),
         2 = rango/espacial con índice (o rango en PK sequential),
-        1 = radio espacial sin índice (fuerza bruta sobre el scan),
+        1 = radio espacial o MATCH booleano sin índice (fuerza bruta),
         0 = sin acceso directo (solo sirve de filtro)."""
         col = self._get_column(table, cond["column"])
         kind = cond["kind"]
+        if kind == "match":
+            if (col.type in (TYPE_TEXT, TYPE_VARCHAR)
+                    and self.catalog.index_on(table, col.name, {"INVERTED"})):
+                return 4
+            return 4 if cond.get("ranked") else 1
         pk = self.catalog.primary_key(table)
         if (pk is not None and col.name == pk.name
                 and kind in ("compare", "between")
@@ -1241,18 +1694,130 @@ class Engine:
                          if c["kind"] == "knn"), None)
         return None
 
+    @staticmethod
+    def _match_condition(where: dict | None) -> dict | None:
+        """La condición MATCH del WHERE (directa o dentro de un AND)."""
+        if where is None:
+            return None
+        if where["kind"] == "match":
+            return where
+        if where["kind"] == "and":
+            return next((c for c in where["conditions"]
+                         if c["kind"] == "match"), None)
+        return None
+
+    # ------------------------------------------------------------------
+    # Búsqueda textual: ranking TF-IDF y evaluación booleana por fila
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ranked_query_terms(q_ast: dict, pre: TextPreprocessor) -> list[str]:
+        """Términos de la consulta para el ranking coseno.
+
+        El ranking es un modelo de bolsa de términos: se admiten términos
+        sueltos o conjunciones (AND explícito o implícito), pero no OR ni
+        NOT, que solo tienen sentido en la recuperación booleana.
+        """
+        terms: list[str] = []
+
+        def collect(node: dict) -> None:
+            if "term" in node:
+                terms.append(node["term"])
+            elif "and" in node:
+                for child in node["and"]:
+                    collect(child)
+            else:
+                raise SemanticError(
+                    "COSINE_SCORE() usa un ranking por bolsa de términos: "
+                    "la consulta MATCH no admite OR ni NOT "
+                    "(esos operadores son para la búsqueda booleana sin "
+                    "COSINE_SCORE)")
+
+        collect(q_ast)
+        return pre.terms(" ".join(terms))
+
+    @staticmethod
+    def _eval_boolean(q_ast: dict, doc_terms: set[str],
+                      pre: TextPreprocessor) -> bool:
+        """Evalúa el AST booleano del MATCH contra los términos de una fila
+        (línea base sin índice: Full Text Scan)."""
+        if "term" in q_ast:
+            terms = pre.terms(q_ast["term"])
+            return bool(terms) and all(t in doc_terms for t in terms)
+        if "and" in q_ast:
+            return all(Engine._eval_boolean(c, doc_terms, pre)
+                       for c in q_ast["and"])
+        if "or" in q_ast:
+            return any(Engine._eval_boolean(c, doc_terms, pre)
+                       for c in q_ast["or"])
+        if "not" in q_ast:
+            return not Engine._eval_boolean(q_ast["not"], doc_terms, pre)
+        return False
+
+    def _fulltext_rank(self, table: str, columns: list[Column],
+                       rows: list[tuple[RID, list]], match_cond: dict,
+                       k: int) -> list[tuple[RID, list, float]]:
+        """Ranking TF-IDF por fuerza bruta (sin índice INVERTED).
+
+        Dos pasadas sobre las filas escaneadas: la primera calcula el df
+        de cada término (de ahí el idf) y la segunda puntúa cada fila con
+        similitud de coseno. Es la línea base del Experimento 6.
+        Devuelve ``[(rid, row, score)]`` ordenado desc y truncado a ``k``.
+        """
+        col = self._get_column(table, match_cond["column"])
+        pos = [c.name for c in columns].index(col.name)
+        pre = self._preprocessor(self._inverted_params(table, col.name))
+        q_ast = parse_match_query(match_cond["query"])
+        query_terms = self._ranked_query_terms(q_ast, pre)
+
+        counts: list[collections.Counter] = []
+        df: dict[str, int] = {}
+        for _rid, row in rows:
+            c = collections.Counter(pre.terms(str(row[pos])))
+            counts.append(c)
+            for term in c:
+                df[term] = df.get(term, 0) + 1
+        n = len(rows)
+        if n == 0 or not query_terms:
+            return []
+        idf = {t: math.log10(n / d) for t, d in df.items()}
+
+        q_counts = collections.Counter(query_terms)
+        q_weights = {t: (1.0 + math.log10(c)) * idf[t]
+                     for t, c in q_counts.items() if t in idf}
+        q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
+        if q_norm == 0.0:
+            return []
+
+        scored: list[tuple[RID, list, float]] = []
+        for (rid, row), c in zip(rows, counts):
+            dot = 0.0
+            norm_sq = 0.0
+            for t, tf in c.items():
+                w = (1.0 + math.log10(tf)) * idf[t]
+                norm_sq += w * w
+                if t in q_weights:
+                    dot += q_weights[t] * w
+            if dot > 0.0 and norm_sq > 0.0:
+                scored.append((rid, row, dot / (math.sqrt(norm_sq) * q_norm)))
+        scored.sort(key=lambda t: t[2], reverse=True)
+        return scored[:k]
+
     def _plan_access(self, table: str, where: dict,
-                     plan: _Plan) -> tuple[list[RID] | None,
-                                           list[tuple[RID, float]] | None,
-                                           dict | None]:
-        """Elige el método de acceso y devuelve (RIDs, KNN ordenado,
+                     plan: _Plan,
+                     limit_hint: int | None = None) -> tuple[
+                         list[RID] | None,
+                         list[tuple[RID, float]] | None,
+                         dict | None]:
+        """Elige el método de acceso y devuelve (RIDs, KNN/MATCH ordenado,
         filtro residual). RIDs None = seq scan; con una conjunción AND la
         mejor condición gobierna el acceso y el resto queda como filtro
-        residual sobre las tuplas recuperadas."""
+        residual sobre las tuplas recuperadas. ``limit_hint`` es el K del
+        Top-K textual (offset+limit o el tope de seguridad)."""
         kind = where["kind"]
         if kind == "and":
             driver, residual = self._split_and(table, where)
-            rids, ordered_knn, _ = self._plan_access(table, driver, plan)
+            rids, ordered_knn, _ = self._plan_access(
+                table, driver, plan, limit_hint=limit_hint)
             t = time.perf_counter()
             n = len(where["conditions"]) - 1
             plan.add("Residual Filter",
@@ -1356,6 +1921,47 @@ class Engine:
                      f"cómputo espacial por fuerza bruta", t)
             return None, None, None
 
+        if kind == "match":
+            if col.type not in (TYPE_TEXT, TYPE_VARCHAR):
+                raise SemanticError(
+                    f"MATCH requiere una columna TEXT o VARCHAR, "
+                    f"'{col.name}' es {col.type_str()}")
+            try:
+                q_ast = parse_match_query(where["query"])
+            except MatchQueryError as exc:
+                raise SemanticError(f"consulta MATCH inválida: {exc}") from exc
+            ranked = bool(where.get("ranked"))
+            meta = self.catalog.index_on(table, col.name, {"INVERTED"})
+            if meta is None:
+                t = time.perf_counter()
+                plan.add("Full Text Scan",
+                         f"sin INVERTED en {table}.{col.name}: "
+                         f"{'ranking TF-IDF' if ranked else 'filtro booleano'}"
+                         f" por fuerza bruta", t)
+                return None, None, None
+            pre = self._preprocessor(meta.get("params") or {})
+            t = time.perf_counter()
+            idx = self._open_inverted(table, col)
+            if ranked:
+                terms = self._ranked_query_terms(q_ast, pre)
+                k = limit_hint or SELECT_ROW_CAP
+                scored = idx.cosine_topk(terms, k)
+                pairs = [( (idx.docs[d][0], idx.docs[d][1]), s)
+                         for d, s in scored]
+                idx.close()
+                plan.add("Inverted Index TopK Scan",
+                         f"USING INVERTED ON {table}.{col.name} "
+                         f"MATCH {where['query']!r} -> "
+                         f"{len(pairs)} candidatos (k={k})", t)
+                return [rid for rid, _s in pairs], pairs, None
+            doc_ids = idx.search_boolean(q_ast, pre)
+            rids = [(idx.docs[d][0], idx.docs[d][1]) for d in doc_ids]
+            idx.close()
+            plan.add("Inverted Index Boolean Scan",
+                     f"USING INVERTED ON {table}.{col.name} "
+                     f"MATCH {where['query']!r} -> {len(rids)} RIDs", t)
+            return rids, None, None
+
         raise ExecutionError(f"condición no soportada: {kind}")
 
     def _plan_access_sequential(self, table: str, pk: Column, where: dict,
@@ -1399,10 +2005,11 @@ class Engine:
     # ------------------------------------------------------------------
     # Filtro en escaneo secuencial
     # ------------------------------------------------------------------
-    def _match(self, columns: list[Column], where: dict, row: list) -> bool:
+    def _match(self, columns: list[Column], where: dict, row: list,
+               table: str | None = None) -> bool:
         kind = where["kind"]
         if kind == "and":
-            return all(self._match(columns, c, row)
+            return all(self._match(columns, c, row, table)
                        for c in where["conditions"])
         col = next(c for c in columns if c.name == where["column"])
         pos = [c.name for c in columns].index(col.name)
@@ -1430,6 +2037,18 @@ class Engine:
             return math.hypot(value[0] - cx, value[1] - cy) <= where["radius"]
         if kind == "knn":
             return True  # el filtro KNN sin índice se aplica tras ordenar
+        if kind == "match":
+            if where.get("ranked"):
+                return True  # el ranking se aplica tras el escaneo
+            # MATCH booleano sin índice INVERTED: evaluación por fila
+            if table is None:
+                raise ExecutionError(
+                    "MATCH booleano requiere el contexto de la tabla")
+            pre = self._preprocessor(
+                self._inverted_params(table, where["column"]))
+            q_ast = parse_match_query(where["query"])
+            doc_terms = set(pre.terms(str(value)))
+            return self._eval_boolean(q_ast, doc_terms, pre)
         return False
 
     # ------------------------------------------------------------------
@@ -1450,7 +2069,8 @@ class Engine:
             t = time.perf_counter()
             heap = self._open_storage(table)
             rids = [rid for rid, raw in self._scan_rows(heap)
-                    if self._match(columns, where, deserialize_row(columns, raw))]
+                    if self._match(columns, where,
+                                   deserialize_row(columns, raw), table)]
             heap.close()
             plan.add("Filter", f"{len(rids)} registros coinciden", t)
 
@@ -1474,15 +2094,24 @@ class Engine:
             t = time.perf_counter()
             icol = self._get_column(table, meta["column"])
             pos = [c.name for c in columns].index(icol.name)
-            if meta["type"] == "BTREE":
-                idx = self._open_btree(table, icol)
-            elif meta["type"] == "HASH":
-                idx = self._open_hash(table, icol)
+            if meta["type"] == "INVERTED":
+                idx = self._open_inverted(table, icol)
+                for rid, _row in victims:
+                    idx.delete_document(rid)
+            elif meta["type"] == "IVF":
+                idx = self._open_ivf(table, icol)
+                for rid, row in victims:
+                    idx.delete(rid, tuple(row[pos]))
             else:
-                idx = self._open_rtree(table, icol)
-            for rid, row in victims:
-                v = row[pos]
-                idx.delete(tuple(v) if icol.type == TYPE_POINT else v, rid)
+                if meta["type"] == "BTREE":
+                    idx = self._open_btree(table, icol)
+                elif meta["type"] == "HASH":
+                    idx = self._open_hash(table, icol)
+                else:
+                    idx = self._open_rtree(table, icol)
+                for rid, row in victims:
+                    v = row[pos]
+                    idx.delete(tuple(v) if icol.type == TYPE_POINT else v, rid)
             idx.close()
             plan.add("Index Maintenance",
                      f"{meta['type']} ON {table}.{icol.name} actualizado", t)
@@ -1527,8 +2156,8 @@ class Engine:
             else:
                 files = [self._file_info(self._heap_path(name))]
             for meta in self.catalog.indexes(name):
-                files.append(self._file_info(
-                    self._index_path(name, meta["column"], meta["type"])))
+                for p in self._index_paths(name, meta["column"], meta["type"]):
+                    files.append(self._file_info(p))
             out.append({
                 "name": name,
                 "organization": organization,

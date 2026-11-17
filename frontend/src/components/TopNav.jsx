@@ -7,6 +7,8 @@ export default function TopNav({
   activeTable,
   sidebarOpen,
   onToggleSidebar,
+  view,
+  onChangeView,
 }) {
   // health: 'checking' | 'ok' | 'down'
   const dot =
@@ -92,6 +94,26 @@ export default function TopNav({
         <span className="hidden text-xs text-helper sm:inline">
           CS2042 · Bases de Datos II
         </span>
+        {/* conmutador de vista: workbench SQL / app del recomendador */}
+        <div className="ml-3 flex gap-1 rounded-full border border-hairline p-0.5">
+          {[
+            ['sql', 'SQL'],
+            ['recommender', 'Recomendador'],
+          ].map(([v, label]) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => onChangeView(v)}
+              className={
+                v === view
+                  ? 'rounded-full bg-dark px-3 py-1 text-xs text-white dark:text-canvas'
+                  : 'rounded-full px-3 py-1 text-xs text-body transition-colors hover:text-ink'
+              }
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
       <div className="flex items-center gap-3">
         <div className="flex items-center gap-2" title={label}>

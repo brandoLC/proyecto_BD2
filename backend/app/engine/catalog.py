@@ -12,7 +12,7 @@ import os
 
 from ..storage.record import Column
 
-INDEX_TYPES = {"BTREE", "HASH", "RTREE"}
+INDEX_TYPES = {"BTREE", "HASH", "RTREE", "INVERTED", "IVF"}
 
 
 class Catalog:
@@ -96,9 +96,11 @@ class Catalog:
     # ------------------------------------------------------------------
     # Índices
     # ------------------------------------------------------------------
-    def add_index(self, table: str, name: str, column: str, itype: str) -> None:
+    def add_index(self, table: str, name: str, column: str, itype: str,
+                  params: dict | None = None) -> None:
         self._data["tables"][table]["indexes"].append(
-            {"name": name, "column": column, "type": itype}
+            {"name": name, "column": column, "type": itype,
+             "params": params or {}}
         )
         self._save()
 

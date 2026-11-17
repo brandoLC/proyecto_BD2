@@ -10,6 +10,7 @@ import PlanPanel from './components/PlanPanel.jsx'
 import IoHistoryChart, { extractAccessType } from './components/IoHistoryChart.jsx'
 import MapPanel from './components/MapPanel.jsx'
 import InferSchemaModal from './components/InferSchemaModal.jsx'
+import RecommenderPanel from './components/RecommenderPanel.jsx'
 
 const TABS = ['Resultados', 'Plan', 'Métricas', 'Mapa']
 const HISTORY_KEY = 'minidb:history'
@@ -85,6 +86,7 @@ export default function App() {
   const [ioHistory, setIoHistory] = useState([])
   const [sidebarOpen, setSidebarOpen] = useState(loadSidebarOpen)
   const [tab, setTab] = useState('Resultados')
+  const [view, setView] = useState('sql') // 'sql' | 'recommender'
 
   const toggleSidebar = useCallback(() => {
     setSidebarOpen((prev) => {
@@ -378,9 +380,14 @@ export default function App() {
         activeTable={activeTable}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={toggleSidebar}
+        view={view}
+        onChangeView={setView}
       />
 
       <main className="px-4 py-6 sm:px-6">
+        {view === 'recommender' ? (
+          <RecommenderPanel theme={theme} />
+        ) : (
         <div
           className={`grid grid-cols-1 gap-5 transition-[grid-template-columns] duration-200 ${
             sidebarOpen ? 'lg:grid-cols-[300px_1fr]' : 'lg:grid-cols-[48px_1fr]'
@@ -488,6 +495,7 @@ export default function App() {
             </section>
           </div>
         </div>
+        )}
       </main>
 
       {inferModalOpen && infer?.data && (

@@ -86,3 +86,40 @@ export async function postQuery(sql) {
   }
   return parseResponse(res)
 }
+
+// ----------------------------------------------------------------------
+// Recomendador e-commerce (Entregable 2)
+// ----------------------------------------------------------------------
+
+// POST multipart: foto + filtros; mode = 'embedding' | 'bovw'.
+export async function recommendImage(file, params) {
+  const form = new FormData()
+  form.append('file', file)
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null && value !== undefined && value !== '') {
+      form.append(key, value)
+    }
+  }
+  return postForm('/api/recommend/image', form)
+}
+
+// POST JSON: búsqueda por descripción en lenguaje natural.
+export async function recommendText(payload) {
+  const res = await fetch('/api/recommend/text', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return parseResponse(res)
+}
+
+// Muestra aleatoria de productos + configuración del dataset cargado.
+export async function getRecommendSample(n = 12) {
+  const res = await fetch(`/api/recommend/sample?n=${n}`)
+  return parseResponse(res)
+}
+
+// URL del thumbnail JPEG de un producto.
+export function productImageUrl(productId) {
+  return `/api/images/${productId}.jpg`
+}

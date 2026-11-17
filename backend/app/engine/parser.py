@@ -3,28 +3,35 @@
 Gramática soportada (keywords case-insensitive, ';' final opcional)::
 
     statement   := create_table | create_index | insert | select | delete
-                 | load_file | drop_table
+                 | load_file | drop_table | set_param
     create_table:= CREATE TABLE ident '(' col_def (',' col_def)* ')'
                    [USING (HEAP | SEQUENTIAL)]
                  | CREATE TABLE ident FROM FILE STRING
     col_def     := ident type [PRIMARY KEY]
-    type        := INT | FLOAT | BOOL | TEXT | POINT | VARCHAR '(' num ')'
+    type        := INT | FLOAT | BOOL | TEXT | POINT
+                 | VARCHAR '(' num ')' | VECTOR '(' num ')'
     create_index:= CREATE INDEX [ident] ON ident '(' ident ')'
-                   USING (BTREE | HASH | RTREE)
+                   USING (BTREE | HASH | RTREE | INVERTED | IVF)
+                   [WITH '(' param '=' value (',' param '=' value)* ')']
     insert      := INSERT INTO ident VALUES '(' value (',' value)* ')'
     value       := ['-'] NUMBER | STRING | TRUE | FALSE | '(' num ',' num ')'
     select      := SELECT ('*' | select_item (',' select_item)*) FROM ident
-                   [WHERE cond (AND cond)*] [LIMIT num [OFFSET num]]
-    select_item := '*' | ident | COUNT '(' '*' ')'
+                   [WHERE cond (AND cond)*]
+                   [ORDER BY ident (ASC | DESC)] [LIMIT num [OFFSET num]]
+    select_item := '*' | ident [AS ident] | COUNT '(' '*' ')'
                  | MIN '(' ident ')' | MAX '(' ident ')'
                  | SUM '(' ident ')' | AVG '(' ident ')'
+                 | COSINE_SCORE '(' ')' [AS ident]
+                 | ident ('<->' | '<=>') STRING [AS ident]  (distancia vectorial)
     cond        := ident op literal                       (op: = < <= > >=)
                  | ident BETWEEN literal AND literal
                  | ident IN '(' point ',' num ')'         (radio espacial)
                  | ident KNN '(' point ',' num ')'        (k vecinos)
+                 | ident MATCH STRING                     (búsqueda textual)
     delete      := DELETE FROM ident WHERE ident '=' literal
     load_file   := LOAD INTO ident FROM FILE STRING
     drop_table  := DROP TABLE ident
+    set_param   := SET ident '.' ident '=' num            (p. ej. ivf.probes)
 
 El AST se representa con diccionarios. Los errores de sintaxis llevan la
 posición (offset en caracteres) dentro del mensaje.
@@ -36,11 +43,12 @@ import re
 
 KEYWORDS = {
     "CREATE", "TABLE", "PRIMARY", "KEY", "INT", "FLOAT", "VARCHAR", "TEXT",
-    "BOOL", "POINT", "INDEX", "ON", "USING", "BTREE", "HASH", "RTREE",
-    "INSERT", "INTO", "VALUES", "SELECT", "FROM", "WHERE", "LIMIT",
-    "OFFSET", "HEAP", "SEQUENTIAL",
+    "BOOL", "POINT", "VECTOR", "INDEX", "ON", "USING", "BTREE", "HASH",
+    "RTREE", "INVERTED", "IVF", "INSERT", "INTO", "VALUES", "SELECT",
+    "FROM", "WHERE", "LIMIT", "OFFSET", "HEAP", "SEQUENTIAL",
     "BETWEEN", "AND", "IN", "KNN", "DELETE", "TRUE", "FALSE",
-    "FILE", "LOAD", "DROP",
+    "FILE", "LOAD", "DROP", "MATCH", "WITH", "AS", "ORDER", "BY",
+    "ASC", "DESC", "SET",
     "COUNT", "MIN", "MAX", "SUM", "AVG",
 }
 
@@ -49,8 +57,8 @@ TOKEN_RE = re.compile(
     (?P<ws>\s+)
   | (?P<number>\d+\.\d+|\d+)
   | (?P<string>'(?:[^']|'')*'|"(?:[^"]|"")*")
-  | (?P<op><=|>=|<>|!=|=|<|>)
-  | (?P<punct>[(),;*\-])
+  | (?P<op><=>|<->|<=|>=|<>|!=|=|<|>)
+  | (?P<punct>[(),;*.\-])
   | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<bad>.)
     """,
@@ -172,6 +180,8 @@ class Parser:
             stmt = self._parse_load()
         elif tok.value == "DROP":
             stmt = self._parse_drop()
+        elif tok.value == "SET":
+            stmt = self._parse_set()
         else:
             raise ParseError(f"sentencia no soportada: {tok.value}", tok.pos)
         tok = self.peek()
@@ -218,15 +228,17 @@ class Parser:
 
     def _parse_col_def(self) -> dict:
         name = self.expect_ident()
-        tok = self.expect_kw("INT", "FLOAT", "BOOL", "TEXT", "POINT", "VARCHAR")
+        tok = self.expect_kw("INT", "FLOAT", "BOOL", "TEXT", "POINT",
+                             "VARCHAR", "VECTOR")
         col_type = tok.value
         size = None
-        if col_type == "VARCHAR":
+        if col_type in ("VARCHAR", "VECTOR"):
             self.expect_punct("(")
             n = self.expect_number()
             if not isinstance(n, int) or n <= 0:
-                raise ParseError("VARCHAR requiere un tamaño entero positivo",
-                                 self.peek().pos)
+                raise ParseError(
+                    f"{col_type} requiere un tamaño entero positivo",
+                    self.peek().pos)
             size = n
             self.expect_punct(")")
         primary_key = False
@@ -247,9 +259,39 @@ class Parser:
         column = self.expect_ident()
         self.expect_punct(")")
         self.expect_kw("USING")
-        tok = self.expect_kw("BTREE", "HASH", "RTREE")
-        return {"type": "create_index", "name": idx_name, "table": table,
-                "column": column, "index_type": tok.value}
+        tok = self.expect_kw("BTREE", "HASH", "RTREE", "INVERTED", "IVF")
+        stmt = {"type": "create_index", "name": idx_name, "table": table,
+                "column": column, "index_type": tok.value, "params": {}}
+        if self.accept_kw("WITH"):
+            stmt["params"] = self._parse_index_params()
+        return stmt
+
+    def _parse_index_params(self) -> dict:
+        """WITH '(' nombre '=' valor (',' nombre '=' valor)* ')'."""
+        params: dict = {}
+        self.expect_punct("(")
+        while True:
+            key = self.expect_ident()
+            tok = self.peek()
+            if not (tok.kind == "op" and tok.value == "="):
+                raise ParseError("se esperaba '=' en los parámetros WITH",
+                                 tok.pos)
+            self.advance()
+            val = self.peek()
+            if val.kind == "string":
+                params[key] = self._parse_string()
+            elif val.kind == "number":
+                params[key] = self.expect_number()
+            elif val.kind == "word":
+                params[key] = self.advance().value.lower()
+            else:
+                raise ParseError("valor de parámetro no soportado", val.pos)
+            if self.peek().kind == "punct" and self.peek().value == ",":
+                self.advance()
+                continue
+            break
+        self.expect_punct(")")
+        return params
 
     # ------------------------------------------------------------------
     # INSERT
@@ -324,9 +366,13 @@ class Parser:
             items.append(self._parse_select_item())
         self.expect_kw("FROM")
         table = self.expect_ident()
-        # Con agregados la lista es de diccionarios {"agg", "column"};
-        # sin agregados se conserva el formato histórico (["*"] o nombres).
-        if any(it["agg"] is not None for it in items):
+        # Modo "enriquecido" (diccionarios): agregados, COSINE_SCORE,
+        # distancia vectorial o alias AS. Sin esas funciones se conserva
+        # el formato histórico (["*"] o lista de nombres).
+        rich = any(it["agg"] is not None or it.get("score")
+                   or it.get("vdist") or it.get("alias")
+                   for it in items)
+        if rich:
             columns = items
         else:
             columns = [it["column"] for it in items]
@@ -340,6 +386,15 @@ class Parser:
                 while self.accept_kw("AND"):
                     conditions.append(self._parse_condition())
                 where = {"kind": "and", "conditions": conditions}
+        order_by = None
+        order_dir = "asc"
+        if self.accept_kw("ORDER"):
+            self.expect_kw("BY")
+            order_by = self.expect_ident()
+            if self.accept_kw("DESC"):
+                order_dir = "desc"
+            else:
+                self.accept_kw("ASC")
         limit = None
         if self.accept_kw("LIMIT"):
             n = self.expect_number()
@@ -360,14 +415,16 @@ class Parser:
                                  self.peek().pos)
             offset = n
         return {"type": "select", "table": table, "columns": columns,
-                "where": where, "limit": limit, "offset": offset}
+                "where": where, "order_by": order_by, "order_dir": order_dir,
+                "limit": limit, "offset": offset}
 
     def _parse_select_item(self) -> dict:
-        """Un elemento de la lista de selección: ``*``, columna o agregado."""
+        """Un elemento de la lista de selección: ``*``, columna, agregado
+        o ``COSINE_SCORE()``, con alias ``AS`` opcional."""
         tok = self.peek()
         if tok.kind == "punct" and tok.value == "*":
             self.advance()
-            return {"agg": None, "column": "*"}
+            return {"agg": None, "column": "*", "alias": None}
         if tok.kind == "kw" and tok.value in self._AGG_FUNCS:
             fn = self.advance().value.lower()
             self.expect_punct("(")
@@ -380,14 +437,41 @@ class Parser:
             else:
                 column = self.expect_ident()
             self.expect_punct(")")
-            return {"agg": fn, "column": column}
+            item = {"agg": fn, "column": column}
+            item["alias"] = self._parse_alias()
+            return item
+        if tok.kind == "word" and tok.value.upper() == "COSINE_SCORE":
+            self.advance()
+            self.expect_punct("(")
+            self.expect_punct(")")
+            item = {"agg": None, "column": None, "score": "cosine"}
+            item["alias"] = self._parse_alias()
+            return item
         if tok.kind == "word":
             nxt = self.tokens[self.i + 1]
+            if nxt.kind == "op" and nxt.value in ("<->", "<=>"):
+                # Distancia vectorial: `embedding <=> '[...]'` (coseno) o
+                # `embedding <-> '[...]'` (L2), estilo pgvector.
+                column = self.advance().value.lower()
+                op = self.advance().value
+                query = self._parse_string()
+                item = {"agg": None, "column": None,
+                        "vdist": {"column": column, "op": op, "query": query}}
+                item["alias"] = self._parse_alias()
+                return item
             if nxt.kind == "punct" and nxt.value == "(":
                 raise ParseError(f"función desconocida '{tok.value}'", tok.pos)
-            return {"agg": None, "column": self.advance().value.lower()}
+            item = {"agg": None, "column": self.advance().value.lower()}
+            item["alias"] = self._parse_alias()
+            return item
         raise ParseError("se esperaba '*', una columna o una función de "
                          f"agregación, se encontró {tok.value!r}", tok.pos)
+
+    def _parse_alias(self) -> str | None:
+        """Alias opcional ``AS ident`` de un elemento del SELECT."""
+        if self.accept_kw("AS"):
+            return self.expect_ident()
+        return None
 
     def _parse_condition(self) -> dict:
         column = self.expect_ident()
@@ -418,6 +502,10 @@ class Parser:
             if not isinstance(k, int) or k <= 0:
                 raise ParseError("KNN requiere un entero positivo", tok.pos)
             return {"kind": "knn", "column": column, "center": center, "k": k}
+        if tok.kind == "kw" and tok.value == "MATCH":
+            self.advance()
+            return {"kind": "match", "column": column,
+                    "query": self._parse_string()}
         if tok.kind == "op":
             self.advance()
             if tok.value in ("<>", "!="):
@@ -457,6 +545,31 @@ class Parser:
         self.expect_kw("FILE")
         return {"type": "load_file", "table": table,
                 "file": self._parse_string()}
+
+    # ------------------------------------------------------------------
+    # SET parametro.valor = numero
+    # ------------------------------------------------------------------
+    def _parse_set(self) -> dict:
+        """``SET ivf.probes = 5;`` — parámetros de sesión del motor."""
+        self.expect_kw("SET")
+        tok = self.peek()
+        # El scope puede ser una palabra cualquiera o la keyword IVF.
+        if tok.kind == "word" or (tok.kind == "kw" and tok.value == "IVF"):
+            scope = self.advance().value.lower()
+        else:
+            raise ParseError(f"se esperaba un identificador, se encontró "
+                             f"{tok.value!r}", tok.pos)
+        self.expect_punct(".")
+        name = self.expect_ident()
+        tok = self.peek()
+        if not (tok.kind == "op" and tok.value == "="):
+            raise ParseError("se esperaba '=' en la sentencia SET", tok.pos)
+        self.advance()
+        value = self.expect_number()
+        if not isinstance(value, int) or value <= 0:
+            raise ParseError("el parámetro SET requiere un entero positivo",
+                             tok.pos)
+        return {"type": "set", "param": f"{scope}.{name}", "value": value}
 
     # ------------------------------------------------------------------
     # DROP TABLE
