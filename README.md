@@ -10,6 +10,12 @@ y ejecutor con plan de consulta. Se expone vía API REST (FastAPI) y se
 consume desde un cliente web (React + Vite + Tailwind v4 + Leaflet) con dos
 vistas: workbench SQL y recomendador e-commerce multimodal.
 
+## Video demostrativo
+
+[Ver el video demostrativo en Google Drive](https://drive.google.com/drive/folders/1CPukP867a-SoSaLXdlUQ1pbSkj3BdoX4?usp=sharing)
+
+El video muestra la inspección de los archivos binarios en disco, la ejecución de consultas SQL con su plan de ejecución y métricas de I/O, la aplicación de IA (recomendador e-commerce) y los resultados de los benchmarks.
+
 Estado actual: **Entregable 2** (relacional + espacial + textual +
 vectorial + aplicación de IA) — semana 15.
 
