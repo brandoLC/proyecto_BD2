@@ -14,6 +14,8 @@ benchmarks/results/
 
 # PDFs del curso (material del profesor, no va al repo)
 *.pdf
+# ... pero las figuras vectoriales del informe sí se versionan:
+!informe/figuras/*.pdf
 
 # Auxiliares de LaTeX (informe/)
 informe/*.aux
